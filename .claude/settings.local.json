@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --version:*)",
+      "Bash(docker:*)",
+      "Bash(npm install:*)",
+      "Bash(python -m uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(netstat:*)",
+      "Bash(ss:*)",
+      "Bash(npx vite:*)",
+      "Bash(npm:*)",
+      "Bash(gcloud auth list:*)",
+      "Bash(gcloud config set:*)",
+      "Bash(gcloud projects get-iam-policy:*)",
+      "Bash(gcloud projects add-iam-policy-binding:*)",
+      "Bash(gcloud compute url-maps invalidate-cdn-cache:*)",
+      "Bash(gcloud services list:*)",
+      "Bash(gcloud auth configure-docker:*)",
+      "Bash(gcloud builds submit:*)",
+      "Bash(gcloud run deploy:*)",
+      "Bash(gcloud secrets create:*)",
+      "Bash(gcloud secrets add-iam-policy-binding:*)",
+      "Bash(gcloud logging read:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(wmic process where \"name=''python.exe''\" get processid,commandline)",
+      "Bash(powershell -c \"Get-Process python -ErrorAction SilentlyContinue | Select-Object Id,Path | Format-Table -AutoSize\")",
+      "Bash(gcloud:*)",
+      "Bash(MSYS_NO_PATHCONV=1 gcloud run services update:*)",
+      "Bash(cmd.exe //c \"gcloud run services update webdeploy-backend --region=europe-west1 --project=adp-413110 --update-env-vars=GOOGLE_APPLICATION_CREDENTIALS=/app/secrets/service-account.json\")",
+      "Bash(cmd.exe //c \"gcloud run services describe webdeploy-backend --region=europe-west1 --project=adp-413110 --format=yaml\")",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
