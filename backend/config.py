@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     BUILD_TIMEOUT_SECONDS: int = 300  # 5 minutes
     PREVIEW_TIMEOUT_SECONDS: int = 30
     MAX_ZIP_SIZE_MB: int = 500
+    PIPELINE_MAX_TIMEOUT_SECONDS: int = 900  # 15 minutes — hard timeout for entire pipeline
 
     # ── Cloud Run ──────────────────────────────────────────────────
     CLOUDRUN_REGION: str = "europe-west1"

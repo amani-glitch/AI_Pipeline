@@ -63,10 +63,42 @@ class PipelineOrchestrator:
         """
         Execute all pipeline steps sequentially for a single deployment.
 
-        On success the deployment record is updated with the result URL.
-        On failure the error is recorded and a notification is sent.
-        Temporary files are always cleaned up in the ``finally`` block.
+        Wraps the entire pipeline in an asyncio timeout so it can never
+        hang forever.  On success the deployment record is updated with
+        the result URL.  On failure the error is recorded and a notification
+        is sent.  Temporary files are always cleaned up in ``finally``.
         """
+        timeout = self._settings.PIPELINE_MAX_TIMEOUT_SECONDS
+        try:
+            await asyncio.wait_for(
+                self._run_pipeline(deployment_id, zip_path, config),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Pipeline %s timed out after %ds", deployment_id, timeout,
+            )
+            db = SessionLocal()
+            crud.update_deployment_status(
+                db,
+                deployment_id,
+                status=DeploymentStatus.FAILED.value,
+                error_message=f"Pipeline timed out after {timeout}s. The build may be too large or a step hung.",
+                completed_at=datetime.now(timezone.utc),
+            )
+            log_cb = get_log_callback(deployment_id)
+            log_cb(
+                f"Pipeline timed out after {timeout}s",
+                level=LogLevel.ERROR.value,
+            )
+
+    async def _run_pipeline(
+        self,
+        deployment_id: str,
+        zip_path: str,
+        config: DeploymentConfig,
+    ) -> None:
+        """Inner pipeline logic, wrapped by run() with a timeout guard."""
         log_cb = get_log_callback(deployment_id)
         ctx = PipelineContext(
             deployment_id=deployment_id,
