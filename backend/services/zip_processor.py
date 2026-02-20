@@ -138,6 +138,92 @@ class ZipProcessingService:
             detected_issues=detected_issues,
         )
 
+    def process_static(self, zip_path: str, temp_dir: str) -> ZipProcessingResult:
+        """
+        Extraction pipeline for static HTML/CSS/JS sites (no Vite required).
+
+        Looks for an index.html file and uses its containing directory as the
+        dist_path directly.  Skips all Vite-specific validation.
+
+        Parameters
+        ----------
+        zip_path : str
+            Absolute path to the uploaded .zip file.
+        temp_dir : str
+            Base temporary directory.
+
+        Returns
+        -------
+        ZipProcessingResult
+            Project metadata with is_static=True.
+
+        Raises
+        ------
+        ValueError
+            If the ZIP is invalid or no index.html is found.
+        """
+        self._log("Starting static site ZIP processing", level="INFO", step="EXTRACT")
+
+        if not os.path.isfile(zip_path):
+            raise ValueError(f"ZIP file not found: {zip_path}")
+        if not zipfile.is_zipfile(zip_path):
+            raise ValueError(f"Not a valid ZIP file: {zip_path}")
+
+        extract_dir = tempfile.mkdtemp(dir=temp_dir, prefix="zip_extract_")
+        self._log(f"Extracting to {extract_dir}", level="INFO", step="EXTRACT")
+
+        try:
+            self._extract_zip(zip_path, extract_dir)
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"Corrupt ZIP file: {exc}") from exc
+
+        source_root = self._unwrap_single_folder(extract_dir)
+        self._log(f"Project root resolved to: {source_root}", level="INFO", step="EXTRACT")
+
+        # Find index.html — at root or up to 2 levels deep
+        index_dir = self._find_index_html_dir(source_root)
+        if index_dir is None:
+            raise ValueError(
+                "Cannot proceed: no index.html found in the uploaded ZIP. "
+                "Ensure the ZIP contains a valid HTML website with an index.html file."
+            )
+
+        self._log(
+            f"Static site detected — using {index_dir} as deployment root",
+            level="INFO",
+            step="EXTRACT",
+        )
+
+        return ZipProcessingResult(
+            source_path=source_root,
+            dist_path=index_dir,
+            vite_config_path=None,
+            package_json={},
+            has_router=False,
+            is_static=True,
+            detected_issues=[],
+        )
+
+    def _find_index_html_dir(self, root: str) -> Optional[str]:
+        """Find the directory containing index.html, preferring the root level."""
+        # Check root first
+        if os.path.isfile(os.path.join(root, "index.html")):
+            return root
+
+        # Search up to 2 levels deep
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ("node_modules", ".git", "__MACOSX", ".cache")
+            ]
+            depth = dirpath.replace(root, "").count(os.sep)
+            if depth > 2:
+                dirnames.clear()
+                continue
+            if "index.html" in filenames:
+                return dirpath
+        return None
+
     # Marker files that identify a deployable project root for Cloud Run
     _PROJECT_MARKERS = (
         "Dockerfile",

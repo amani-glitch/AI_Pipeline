@@ -86,6 +86,22 @@ def list_deployments(
     return [_doc_to_record(doc) for doc in query.stream()]
 
 
+def delete_deployment(db: FirestoreClient, deployment_id: str) -> bool:
+    """Delete a deployment record and its associated logs."""
+    doc_ref = db.collection(_DEPLOYMENTS).document(deployment_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return False
+
+    # Delete associated logs
+    logs_query = db.collection(_LOGS).where("deployment_id", "==", deployment_id)
+    for log_doc in logs_query.stream():
+        log_doc.reference.delete()
+
+    doc_ref.delete()
+    return True
+
+
 def update_deployment_status(
     db: FirestoreClient,
     deployment_id: str,

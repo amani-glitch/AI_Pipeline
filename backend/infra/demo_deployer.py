@@ -123,6 +123,127 @@ class DemoDeployer:
                 backend_bucket=backend_bucket_name,
             )
 
+    # ─── delete entry point ─────────────────────────────────────────────
+
+    async def delete(self, website_name: str) -> None:
+        """Remove all demo infrastructure for *website_name*.
+
+        Deletion order matters due to dependencies:
+        1. Remove path rule from shared URL map
+        2. Delete backend bucket (CDN)
+        3. Delete storage bucket + all objects
+        """
+        sname = safe_name(website_name)
+        bucket_name = get_bucket_name(website_name, "demo")
+        backend_bucket_name = get_backend_bucket_name(website_name, "demo")
+
+        await self._emit(f"[DELETE] Starting demo cleanup for '{website_name}'")
+
+        # 1. Remove path rule from shared URL map
+        await self._remove_url_map_path_rule(website_name, backend_bucket_name)
+
+        # 2. Delete backend bucket
+        await self._delete_backend_bucket(backend_bucket_name)
+
+        # 3. Delete storage bucket + all objects
+        await self._delete_storage_bucket(bucket_name)
+
+        await self._emit(f"[DELETE] Demo cleanup complete for '{website_name}'")
+
+    async def _remove_url_map_path_rule(
+        self, website_name: str, backend_bucket_name: str,
+    ) -> None:
+        """Remove path rules for the website from the shared demo URL map."""
+        url_map_name = self._config.DEMO_URL_MAP_NAME
+        await self._emit(f"[DELETE] Removing path rule for /{website_name} from URL map '{url_map_name}'")
+
+        def _update() -> None:
+            url_map = (
+                self._compute.urlMaps()
+                .get(project=self._project_id, urlMap=url_map_name)
+                .execute()
+            )
+
+            desired_paths = {f"/{website_name}", f"/{website_name}/*"}
+
+            # Find the path matcher for the demo domain
+            host_rules = url_map.get("hostRules", [])
+            target_matcher_name = None
+            for hr in host_rules:
+                if self._config.DEMO_DOMAIN in hr.get("hosts", []):
+                    target_matcher_name = hr.get("pathMatcher")
+                    break
+
+            if target_matcher_name is None:
+                logger.warning("No host rule for demo domain — nothing to remove.")
+                return
+
+            for pm in url_map.get("pathMatchers", []):
+                if pm.get("name") == target_matcher_name:
+                    existing_rules = pm.get("pathRules", [])
+                    cleaned = [
+                        rule for rule in existing_rules
+                        if not any(p in desired_paths for p in rule.get("paths", []))
+                    ]
+                    pm["pathRules"] = cleaned
+                    break
+
+            operation = (
+                self._compute.urlMaps()
+                .patch(project=self._project_id, urlMap=url_map_name, body=url_map)
+                .execute()
+            )
+            wait_for_global_operation(self._compute, self._project_id, operation["name"])
+            logger.info("Removed path rules for %s from URL map.", website_name)
+
+        await self._run_sync(_update)
+        await self._emit(f"[DELETE] Path rule removed for /{website_name}")
+
+    async def _delete_backend_bucket(self, backend_bucket_name: str) -> None:
+        """Delete the Compute Engine backend bucket."""
+        await self._emit(f"[DELETE] Deleting backend bucket: {backend_bucket_name}")
+
+        def _delete() -> None:
+            try:
+                operation = (
+                    self._compute.backendBuckets()
+                    .delete(project=self._project_id, backendBucket=backend_bucket_name)
+                    .execute()
+                )
+                wait_for_global_operation(self._compute, self._project_id, operation["name"])
+                logger.info("Backend bucket %s deleted.", backend_bucket_name)
+            except api_errors.HttpError as err:
+                if err.resp.status == 404:
+                    logger.info("Backend bucket %s not found — already deleted.", backend_bucket_name)
+                else:
+                    raise
+
+        await self._run_sync(_delete)
+        await self._emit(f"[DELETE] Backend bucket deleted: {backend_bucket_name}")
+
+    async def _delete_storage_bucket(self, bucket_name: str) -> None:
+        """Delete the storage bucket and all its objects."""
+        await self._emit(f"[DELETE] Deleting storage bucket: {bucket_name}")
+
+        def _delete() -> None:
+            try:
+                bucket = self._storage_client.get_bucket(bucket_name)
+                # Delete all objects first
+                blobs = list(bucket.list_blobs())
+                if blobs:
+                    bucket.delete_blobs(blobs)
+                    logger.info("Deleted %d objects from bucket %s.", len(blobs), bucket_name)
+                bucket.delete()
+                logger.info("Storage bucket %s deleted.", bucket_name)
+            except Exception as exc:
+                if "404" in str(exc) or "NotFound" in str(exc):
+                    logger.info("Bucket %s not found — already deleted.", bucket_name)
+                else:
+                    raise
+
+        await self._run_sync(_delete)
+        await self._emit(f"[DELETE] Storage bucket deleted: {bucket_name}")
+
     # =================================================================
     #  Step 1 — Storage Bucket
     # =================================================================

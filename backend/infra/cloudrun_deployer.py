@@ -126,6 +126,74 @@ class CloudRunDeployer:
                 docker_image=image_uri,
             )
 
+    # ── delete entry point ──────────────────────────────────────────────
+
+    async def delete(self, website_name: str) -> None:
+        """Remove the Cloud Run service and its Artifact Registry images.
+
+        Deletion order:
+        1. Delete Cloud Run service
+        2. Delete Docker images from Artifact Registry
+        """
+        sname = safe_name(website_name)
+        service_id = sname
+        parent = f"projects/{self._project_id}/locations/{self._region}"
+        service_name = f"{parent}/services/{service_id}"
+
+        await self._emit(f"[DELETE] Starting Cloud Run cleanup for '{website_name}'")
+
+        # 1. Delete Cloud Run service
+        await self._emit(f"[DELETE] Deleting Cloud Run service: {service_id}")
+        try:
+            operation = await asyncio.to_thread(self._delete_service, service_name)
+            await self._emit("[DELETE] Waiting for service deletion...")
+            await asyncio.to_thread(self._wait_for_operation, operation["name"])
+            await self._emit(f"[DELETE] Cloud Run service '{service_id}' deleted")
+        except Exception as exc:
+            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+                await self._emit(f"[DELETE] Service '{service_id}' not found — already deleted")
+            else:
+                raise
+
+        # 2. Delete Artifact Registry images
+        await self._emit(f"[DELETE] Deleting Artifact Registry images for '{sname}'")
+        try:
+            await asyncio.to_thread(self._delete_ar_images, sname)
+            await self._emit(f"[DELETE] Artifact Registry images deleted for '{sname}'")
+        except Exception as exc:
+            await self._emit(f"[DELETE] Could not delete AR images (non-fatal): {exc}")
+
+        await self._emit(f"[DELETE] Cloud Run cleanup complete for '{website_name}'")
+
+    def _delete_service(self, service_name: str) -> dict:
+        """Delete a Cloud Run service."""
+        return (
+            self._run_v2.projects().locations().services()
+            .delete(name=service_name)
+            .execute()
+        )
+
+    def _delete_ar_images(self, package_name: str) -> None:
+        """Delete all images for a package from Artifact Registry."""
+        from googleapiclient import discovery, errors as api_errors
+
+        ar = discovery.build(
+            "artifactregistry", "v1", credentials=self._credentials, cache_discovery=False,
+        )
+        repo = self._config.CLOUDRUN_ARTIFACT_REPO
+        parent = f"projects/{self._project_id}/locations/{self._region}/repositories/{repo}/packages/{package_name}"
+
+        try:
+            ar.projects().locations().repositories().packages().delete(
+                name=parent,
+            ).execute()
+            logger.info("Deleted AR package %s", parent)
+        except Exception as exc:
+            if "404" in str(exc) or "NOT_FOUND" in str(exc):
+                logger.info("AR package %s not found — already deleted.", parent)
+            else:
+                raise
+
     # ── Service spec ───────────────────────────────────────────────────
 
     def _build_service_spec(self, service_name: str, image_uri: str) -> dict[str, Any]:

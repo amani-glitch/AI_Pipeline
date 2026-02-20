@@ -142,6 +142,76 @@ async def create_deployment(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  DELETE /api/deployments/{deployment_id} — delete deployment + GCP resources
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.delete("/deployments/{deployment_id}", status_code=status.HTTP_200_OK)
+async def delete_deployment(
+    deployment_id: str,
+    db=Depends(get_db),
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Delete a deployment and clean up its GCP resources.
+
+    Depending on the deployment mode:
+    - **demo**: removes path rule from URL map, backend bucket, storage bucket
+    - **cloudrun**: removes Cloud Run service and Artifact Registry images
+    - **prod**: only deletes the DB record (prod resources require manual cleanup)
+    """
+    record = crud.get_deployment(db, deployment_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Deployment '{deployment_id}' not found.",
+        )
+
+    mode = record.mode
+    website_name = record.website_name
+    errors_list = []
+
+    async def _noop_log(message: str) -> None:
+        logger.info("[DELETE %s] %s", deployment_id[:8], message)
+
+    # Clean up GCP resources based on mode
+    if mode == DeploymentMode.DEMO.value:
+        try:
+            from infra.demo_deployer import DemoDeployer
+            deployer = DemoDeployer(config=settings, log_callback=_noop_log)
+            await deployer.delete(website_name=website_name)
+        except Exception as exc:
+            logger.exception("Failed to delete demo resources for %s", deployment_id)
+            errors_list.append(f"Demo cleanup error: {exc}")
+
+    elif mode == DeploymentMode.CLOUDRUN.value:
+        try:
+            from infra.cloudrun_deployer import CloudRunDeployer
+            deployer = CloudRunDeployer(config=settings, log_callback=_noop_log)
+            await deployer.delete(website_name=website_name)
+        except Exception as exc:
+            logger.exception("Failed to delete Cloud Run resources for %s", deployment_id)
+            errors_list.append(f"Cloud Run cleanup error: {exc}")
+
+    elif mode == DeploymentMode.PROD.value:
+        # Prod has too many interdependent resources — flag for manual cleanup
+        logger.info("Prod deployment %s — skipping automatic resource cleanup", deployment_id)
+
+    # Always delete the DB record
+    crud.delete_deployment(db, deployment_id)
+
+    result = {
+        "deleted": True,
+        "deployment_id": deployment_id,
+        "mode": mode,
+        "website_name": website_name,
+    }
+    if errors_list:
+        result["warnings"] = errors_list
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  GET /api/deployments — list all deployments
 # ═══════════════════════════════════════════════════════════════════════
 

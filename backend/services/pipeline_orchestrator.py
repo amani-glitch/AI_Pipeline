@@ -232,17 +232,38 @@ class PipelineOrchestrator:
                 service.process_generic, ctx.zip_path, str(self._settings.temp_path),
             )
         else:
-            result = await asyncio.to_thread(
-                service.process, ctx.zip_path, str(self._settings.temp_path),
-            )
+            # Try Vite project first; fall back to static HTML/CSS/JS
+            try:
+                result = await asyncio.to_thread(
+                    service.process, ctx.zip_path, str(self._settings.temp_path),
+                )
+            except ValueError:
+                log_cb(
+                    "No Vite project detected — trying static HTML/CSS/JS mode",
+                    level=LogLevel.INFO.value,
+                    step=PipelineStep.EXTRACT.value,
+                )
+                result = await asyncio.to_thread(
+                    service.process_static, ctx.zip_path, str(self._settings.temp_path),
+                )
 
         ctx.source_path = result.source_path
         ctx.dist_path = result.dist_path
         ctx.vite_config_path = result.vite_config_path
         ctx.package_json = result.package_json
         ctx.has_router = result.has_router
+        ctx.is_static = result.is_static
 
     async def _step_ai_inspect(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        if ctx.is_static:
+            log_cb(
+                "Static HTML site — skipping AI inspection",
+                level=LogLevel.INFO.value,
+                step=PipelineStep.AI_INSPECT.value,
+            )
+            ctx.claude_summary = "Static HTML/CSS/JS site — no AI inspection needed."
+            return
+
         from services.claude_validator import ClaudeValidationService
 
         service = ClaudeValidationService(
@@ -259,6 +280,14 @@ class PipelineOrchestrator:
         ctx.claude_summary = result.summary
 
     async def _step_ai_fix(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        if ctx.is_static:
+            log_cb(
+                "Static HTML site — skipping AI fix",
+                level=LogLevel.INFO.value,
+                step=PipelineStep.AI_FIX.value,
+            )
+            return
+
         # AI_FIX is combined with AI_INSPECT — the validate_and_fix call
         # already applies any fixes.  Mark as completed (the dispatcher
         # handles the status update).
@@ -269,6 +298,14 @@ class PipelineOrchestrator:
         )
 
     async def _step_build(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        if ctx.is_static:
+            log_cb(
+                "Static HTML site — skipping build (no npm install/build needed)",
+                level=LogLevel.INFO.value,
+                step=PipelineStep.BUILD.value,
+            )
+            return
+
         if ctx.config.mode == DeploymentMode.CLOUDRUN:
             await self._step_build_cloudrun(ctx, log_cb)
             return
@@ -323,6 +360,19 @@ class PipelineOrchestrator:
         )
 
     async def _step_verify(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        if ctx.is_static:
+            # For static sites, just verify index.html exists in dist_path
+            import os
+            index_path = os.path.join(ctx.dist_path, "index.html")
+            if not os.path.isfile(index_path):
+                raise RuntimeError(f"index.html not found at {ctx.dist_path}")
+            log_cb(
+                "Static HTML site — verified index.html exists",
+                level=LogLevel.INFO.value,
+                step=PipelineStep.VERIFY.value,
+            )
+            return
+
         if ctx.config.mode == DeploymentMode.CLOUDRUN:
             await self._step_verify_cloudrun(ctx, log_cb)
             return

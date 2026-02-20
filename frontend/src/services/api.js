@@ -49,4 +49,14 @@ export async function getDeploymentLogs(id) {
   return response.data;
 }
 
+/**
+ * Delete a deployment and clean up its GCP resources.
+ * @param {string} id - Deployment ID.
+ * @returns {Promise<object>} Deletion result.
+ */
+export async function deleteDeployment(id) {
+  const response = await api.delete(`/api/deployments/${id}`);
+  return response.data;
+}
+
 export default api;

@@ -6,8 +6,9 @@ import {
   Inbox,
   RefreshCw,
   Loader,
+  Trash2,
 } from "lucide-react";
-import { getDeployments } from "../services/api";
+import { getDeployments, deleteDeployment } from "../services/api";
 
 const STATUS_BADGE = {
   queued: "bg-gray-100 text-gray-700 ring-gray-300",
@@ -22,8 +23,15 @@ const MODE_BADGE = {
   cloudrun: "bg-teal-100 text-teal-700 ring-teal-300",
 };
 
+const MODE_LABELS = {
+  demo: "Demo",
+  prod: "Prod",
+  cloudrun: "Cloud Run",
+};
+
 /**
- * Deployment history table with sortable date column, status/mode badges, and clickable rows.
+ * Deployment history table with sortable date column, status/mode badges,
+ * delete buttons, and clickable rows.
  */
 export default function DeploymentHistory() {
   const navigate = useNavigate();
@@ -31,13 +39,13 @@ export default function DeploymentHistory() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [sortAsc, setSortAsc] = useState(false); // default newest first
+  const [deleting, setDeleting] = useState({}); // { [id]: true } while deleting
 
   const fetchData = async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await getDeployments();
-      // Normalize: API might return { deployments: [...] } or just an array
       setDeployments(Array.isArray(data) ? data : data.deployments || []);
     } catch (err) {
       setError(err.response?.data?.detail || err.message || "Failed to load deployments");
@@ -49,6 +57,34 @@ export default function DeploymentHistory() {
   useEffect(() => {
     fetchData();
   }, []);
+
+  const handleDelete = async (e, dep) => {
+    e.stopPropagation();
+
+    const modeLabel = MODE_LABELS[dep.mode] || dep.mode;
+    const msg =
+      dep.mode === "prod"
+        ? `Delete "${dep.website_name}" (${modeLabel})?\n\nNote: Production GCP resources (IP, LB, SSL, DNS) must be deleted manually from the GCP Console.`
+        : `Delete "${dep.website_name}" (${modeLabel})?\n\nThis will permanently remove all associated GCP resources.`;
+
+    if (!window.confirm(msg)) return;
+
+    setDeleting((prev) => ({ ...prev, [dep.id]: true }));
+    try {
+      const result = await deleteDeployment(dep.id);
+      if (result.warnings?.length) {
+        alert(`Deleted with warnings:\n${result.warnings.join("\n")}`);
+      }
+      // Remove from local state
+      setDeployments((prev) => prev.filter((d) => d.id !== dep.id));
+    } catch (err) {
+      alert(
+        `Failed to delete: ${err.response?.data?.detail || err.message || "Unknown error"}`
+      );
+    } finally {
+      setDeleting((prev) => ({ ...prev, [dep.id]: false }));
+    }
+  };
 
   const sorted = useMemo(() => {
     const copy = [...deployments];
@@ -198,16 +234,35 @@ export default function DeploymentHistory() {
                       {formatDate(dep.created_at)}
                     </td>
                     <td className="px-6 py-4">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          navigate(`/deployments/${dep.id}`);
-                        }}
-                        className="text-[#2563EB] hover:text-blue-700 text-xs font-medium
-                          transition-colors"
-                      >
-                        View Details
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigate(`/deployments/${dep.id}`);
+                          }}
+                          className="text-[#2563EB] hover:text-blue-700 text-xs font-medium
+                            transition-colors"
+                        >
+                          View
+                        </button>
+                        {(dep.status === "success" || dep.status === "failed") && (
+                          <button
+                            onClick={(e) => handleDelete(e, dep)}
+                            disabled={deleting[dep.id]}
+                            className="inline-flex items-center gap-1 text-red-500 hover:text-red-700
+                              text-xs font-medium transition-colors disabled:opacity-50
+                              disabled:cursor-not-allowed"
+                            title={`Delete ${dep.mode} deployment`}
+                          >
+                            {deleting[dep.id] ? (
+                              <Loader className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-3.5 h-3.5" />
+                            )}
+                            Delete
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}

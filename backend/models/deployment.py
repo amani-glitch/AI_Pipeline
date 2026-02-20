@@ -140,6 +140,7 @@ class PipelineContext(BaseModel):
     vite_config_path: Optional[str] = None
     package_json: Optional[dict] = None
     has_router: bool = False
+    is_static: bool = False
     claude_summary: Optional[str] = None
     result_url: Optional[str] = None
     bucket_name: Optional[str] = None
@@ -156,6 +157,7 @@ class ZipProcessingResult(BaseModel):
     vite_config_path: Optional[str] = None
     package_json: dict = {}
     has_router: bool = False
+    is_static: bool = False
     detected_issues: list[str] = []
 
 
