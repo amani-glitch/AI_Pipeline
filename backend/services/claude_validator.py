@@ -364,6 +364,9 @@ arrays and a summary saying the project is ready for deployment.
                         level="WARNING",
                         step="AI_INSPECT",
                     )
+                    # Send alert email for auth/billing errors
+                    if exc.status_code in (401, 402, 403):
+                        self._send_api_key_alert(exc.status_code, str(exc.message))
                     return ""
 
             except anthropic.APIConnectionError as exc:
@@ -547,3 +550,64 @@ arrays and a summary saying the project is ready for deployment.
                 )
 
         return applied
+
+    # ── API key alert notification ─────────────────────────────────────
+
+    def _send_api_key_alert(self, status_code: int, error_message: str) -> None:
+        """
+        Send an alert email when the Claude API key is expired, invalid,
+        or has run out of credits (401/402/403).
+        """
+        try:
+            from services.email_service import EmailService
+            import asyncio
+
+            alert_recipients = [
+                "Eline@bestoftours.co.uk",
+                "amani@bestoftours.co.uk",
+            ]
+
+            status_labels = {
+                401: "Invalid / Expired API Key",
+                402: "Insufficient Credits (Payment Required)",
+                403: "Access Denied / Forbidden",
+            }
+            reason = status_labels.get(status_code, f"HTTP {status_code}")
+
+            service = EmailService(settings=self._settings)
+
+            # Build and send the alert — we're in a sync thread, so use
+            # asyncio.run() in a new event loop for this one-off send.
+            async def _send():
+                await service.send_notification(
+                    website_name="[SYSTEM ALERT] Claude API Key",
+                    mode="alert",
+                    success=False,
+                    error_message=(
+                        f"Claude API Key Error: {reason}\n\n"
+                        f"HTTP Status: {status_code}\n"
+                        f"Error Details: {error_message}\n\n"
+                        f"The AI validation step will be skipped until this is resolved.\n"
+                        f"Please add credits or replace the API key in the Cloud Run "
+                        f"environment variable ANTHROPIC_API_KEY."
+                    ),
+                    claude_summary=None,
+                    recipients=alert_recipients,
+                )
+
+            # Run in a new event loop since we're inside a thread
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_soon_threadsafe(
+                    asyncio.ensure_future, _send()
+                )
+            except RuntimeError:
+                asyncio.run(_send())
+
+            self._log(
+                f"API key alert email sent to {', '.join(alert_recipients)}",
+                level="WARNING",
+                step="AI_INSPECT",
+            )
+        except Exception as exc:
+            logger.warning("Failed to send API key alert email: %s", exc)

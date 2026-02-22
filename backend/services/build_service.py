@@ -284,49 +284,66 @@ class BuildService:
         env: Optional[dict] = None,
     ) -> tuple[str, str, int]:
         """
-        Run a subprocess command with timeout and real-time logging.
+        Run a subprocess command with timeout and real-time log streaming.
 
+        Uses a background thread to read stdout/stderr and log lines as they
+        arrive, while the main thread waits for the process to finish.
         Returns (stdout, stderr, returncode).
         """
         self._log(f"$ {' '.join(cmd)}", level="INFO", step="BUILD")
 
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                shell=(os.name == "nt"),  # Windows needs shell=True to find .cmd scripts (npm.cmd)
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=(os.name == "nt"),
             )
 
-            stdout = result.stdout or ""
-            stderr = result.stderr or ""
+            import threading
 
-            # Log last portion of stdout for visibility
-            if stdout.strip():
-                # Only log the tail to avoid flooding
-                tail = stdout.strip().split("\n")[-10:]
-                for line in tail:
-                    self._log(f"  {line}", level="INFO", step="BUILD")
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
 
-            if result.returncode != 0 and stderr.strip():
-                tail = stderr.strip().split("\n")[-10:]
-                for line in tail:
-                    self._log(f"  [stderr] {line}", level="WARNING", step="BUILD")
+            def _reader(stream, lines, prefix, level):
+                for raw_line in stream:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                    lines.append(line)
+                    if line.strip():
+                        self._log(f"  {prefix}{line}", level=level, step="BUILD")
 
-            return stdout, stderr, result.returncode
-
-        except subprocess.TimeoutExpired:
-            self._log(
-                f"Command timed out after {timeout}s: {' '.join(cmd)}",
-                level="ERROR",
-                step="BUILD",
+            t_out = threading.Thread(
+                target=_reader, args=(proc.stdout, stdout_lines, "", "INFO"), daemon=True,
             )
-            raise RuntimeError(
-                f"Command timed out after {timeout} seconds: {' '.join(cmd)}"
+            t_err = threading.Thread(
+                target=_reader, args=(proc.stderr, stderr_lines, "[stderr] ", "WARNING"), daemon=True,
             )
+            t_out.start()
+            t_err.start()
+
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                self._log(
+                    f"Command timed out after {timeout}s: {' '.join(cmd)}",
+                    level="ERROR",
+                    step="BUILD",
+                )
+                raise RuntimeError(
+                    f"Command timed out after {timeout} seconds: {' '.join(cmd)}"
+                )
+
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+
+            return "\n".join(stdout_lines), "\n".join(stderr_lines), proc.returncode
+
+        except RuntimeError:
+            raise
         except FileNotFoundError:
             self._log(
                 f"Command not found: {cmd[0]}. Ensure Node.js/npm is installed.",

@@ -100,13 +100,15 @@ class DockerfileGenerator:
             all_deps.update(pkg.get("dependencies", {}))
             all_deps.update(pkg.get("devDependencies", {}))
 
+            has_lockfile = os.path.isfile(os.path.join(source_path, "package-lock.json"))
             if "vite" in all_deps:
                 self._log("Detected static Vite project — generating nginx Dockerfile", level="INFO", step="BUILD")
-                content = self._template_static_vite()
+                content = self._template_static_vite(has_lockfile=has_lockfile)
                 self._write_dockerfile(source_path, content)
                 return "static_vite", content
 
             # 2b. Node.js with start script
+            has_lockfile = os.path.isfile(os.path.join(source_path, "package-lock.json"))
             scripts = pkg.get("scripts", {})
             if "start" in scripts:
                 self._log(
@@ -114,7 +116,7 @@ class DockerfileGenerator:
                     level="INFO",
                     step="BUILD",
                 )
-                content = self._template_nodejs()
+                content = self._template_nodejs(has_lockfile=has_lockfile)
                 self._write_dockerfile(source_path, content)
                 return "nodejs", content
 
@@ -126,7 +128,7 @@ class DockerfileGenerator:
                     level="INFO",
                     step="BUILD",
                 )
-                content = self._template_nodejs_with_entrypoint(entrypoint)
+                content = self._template_nodejs_with_entrypoint(entrypoint, has_lockfile=has_lockfile)
                 self._write_dockerfile(source_path, content)
                 return "nodejs", content
 
@@ -182,14 +184,15 @@ class DockerfileGenerator:
     # ── Templates ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _template_nodejs() -> str:
-        return """\
+    def _template_nodejs(has_lockfile: bool = True) -> str:
+        install_cmd = "RUN npm ci --only=production" if has_lockfile else "RUN npm install --only=production"
+        return f"""\
 FROM node:20-alpine
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+{install_cmd}
 
 COPY . .
 
@@ -200,45 +203,46 @@ CMD ["npm", "start"]
 """
 
     @staticmethod
-    def _template_static_vite() -> str:
-        return """\
-# Stage 1: Build
-FROM node:20-alpine AS build
-
-WORKDIR /app
-
-COPY package*.json ./
-COPY tsconfig*.json ./
-RUN npm ci
-
-COPY . .
-
-# Build: try npm run build first, fall back to direct vite build
-# (skips tsc type-checking that may fail on strict projects)
-ENV NODE_ENV=production
-RUN npm run build 2>&1 || npx vite build 2>&1
-
-# Stage 2: Serve with nginx
-FROM nginx:alpine
-
-COPY --from=build /app/dist /usr/share/nginx/html
-
-# nginx config for SPA + Cloud Run port
-RUN printf 'server {\\n\
-    listen 8080;\\n\
-    server_name _;\\n\
-    root /usr/share/nginx/html;\\n\
-    index index.html;\\n\
-    location / {\\n\
-        try_files $uri $uri/ /index.html;\\n\
-    }\\n\
-}\\n' > /etc/nginx/conf.d/default.conf
-
-ENV PORT=8080
-EXPOSE 8080
-
-CMD ["nginx", "-g", "daemon off;"]
-"""
+    def _template_static_vite(has_lockfile: bool = True) -> str:
+        install_cmd = "RUN npm ci" if has_lockfile else "RUN npm install"
+        return (
+            "# Stage 1: Build\n"
+            "FROM node:20-alpine AS build\n"
+            "\n"
+            "WORKDIR /app\n"
+            "\n"
+            "COPY package*.json ./\n"
+            "COPY tsconfig*.json ./\n"
+            + install_cmd + "\n"
+            "\n"
+            "COPY . .\n"
+            "\n"
+            "# Build: try npm run build first, fall back to direct vite build\n"
+            "# (skips tsc type-checking that may fail on strict projects)\n"
+            "ENV NODE_ENV=production\n"
+            "RUN npm run build 2>&1 || npx vite build 2>&1\n"
+            "\n"
+            "# Stage 2: Serve with nginx\n"
+            "FROM nginx:alpine\n"
+            "\n"
+            "COPY --from=build /app/dist /usr/share/nginx/html\n"
+            "\n"
+            "# nginx config for SPA + Cloud Run port\n"
+            "RUN printf 'server {\\\\n\\\n"
+            "    listen 8080;\\\\n\\\n"
+            "    server_name _;\\\\n\\\n"
+            "    root /usr/share/nginx/html;\\\\n\\\n"
+            "    index index.html;\\\\n\\\n"
+            "    location / {\\\\n\\\n"
+            "        try_files $uri $uri/ /index.html;\\\\n\\\n"
+            "    }\\\\n\\\n"
+            "}\\\\n' > /etc/nginx/conf.d/default.conf\n"
+            "\n"
+            "ENV PORT=8080\n"
+            "EXPOSE 8080\n"
+            "\n"
+            'CMD ["nginx", "-g", "daemon off;"]\n'
+        )
 
     @staticmethod
     def _template_static_html() -> str:
@@ -288,14 +292,15 @@ CMD {entrypoint}
 """
 
     @staticmethod
-    def _template_nodejs_with_entrypoint(entrypoint: str) -> str:
+    def _template_nodejs_with_entrypoint(entrypoint: str, has_lockfile: bool = True) -> str:
+        install_cmd = "RUN npm ci --only=production" if has_lockfile else "RUN npm install --only=production"
         return f"""\
 FROM node:20-alpine
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+{install_cmd}
 
 COPY . .
 

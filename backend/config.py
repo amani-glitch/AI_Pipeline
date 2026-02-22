@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./data/webdeploy.db"
 
     # ── Build ────────────────────────────────────────────────────────
-    BUILD_TIMEOUT_SECONDS: int = 300  # 5 minutes
+    BUILD_TIMEOUT_SECONDS: int = 600  # 10 minutes
     PREVIEW_TIMEOUT_SECONDS: int = 30
     MAX_ZIP_SIZE_MB: int = 500
     PIPELINE_MAX_TIMEOUT_SECONDS: int = 900  # 15 minutes — hard timeout for entire pipeline

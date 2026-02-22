@@ -29,8 +29,8 @@ def unsubscribe_logs(deployment_id: str, q: asyncio.Queue) -> None:
         del _ws_subscribers[deployment_id]
 
 
-async def broadcast_log(deployment_id: str, message: str) -> None:
-    """Push a log line to all WebSocket subscribers for a deployment."""
+def _broadcast_sync(deployment_id: str, message: str) -> None:
+    """Push a log line to all WS subscribers (must run on the event-loop thread)."""
     for q in list(_ws_subscribers.get(deployment_id, [])):
         try:
             q.put_nowait(message)
@@ -38,21 +38,35 @@ async def broadcast_log(deployment_id: str, message: str) -> None:
             pass  # Drop if client is slow
 
 
+async def broadcast_log(deployment_id: str, message: str) -> None:
+    """Push a log line to all WebSocket subscribers for a deployment."""
+    _broadcast_sync(deployment_id, message)
+
+
 def get_log_callback(deployment_id: str) -> Callable:
     """
     Returns a callable that:
       1. Logs to Python logger
-      2. Persists to the database
-      3. Broadcasts to WebSocket subscribers
+      2. Broadcasts to WebSocket subscribers (thread-safe)
+
+    The callback is safe to call from any thread (e.g. inside
+    asyncio.to_thread workers) because it uses call_soon_threadsafe
+    to schedule the broadcast on the main event loop.
     """
+    # Capture the event loop at creation time — we are on the async thread
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
     def _log(message: str, level: str = "INFO", step: str | None = None) -> None:
         logger.log(logging.getLevelName(level), "[%s] %s", deployment_id[:8], message)
-        # DB persistence is handled by the orchestrator (to keep this sync-safe)
-        # WS broadcast must happen in an event loop
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(broadcast_log(deployment_id, message))
-        except RuntimeError:
-            pass  # No event loop — skip WS broadcast (e.g., during tests)
+
+        # Broadcast to WebSocket clients — thread-safe
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(_broadcast_sync, deployment_id, message)
+            except RuntimeError:
+                pass  # Loop closed
 
     return _log

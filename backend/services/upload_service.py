@@ -211,16 +211,29 @@ class UploadService:
         bucket: storage.Bucket,
         abs_path: str,
         object_name: str,
+        max_retries: int = 3,
     ) -> None:
         """Upload a single file to GCS with correct Content-Type and Cache-Control."""
         content_type = self._detect_content_type(abs_path)
         cache_control = self._get_cache_control(abs_path)
 
-        blob = bucket.blob(object_name)
-        blob.content_type = content_type
-        blob.cache_control = cache_control
+        import time as _time
 
-        blob.upload_from_filename(abs_path)
+        for attempt in range(1, max_retries + 1):
+            try:
+                blob = bucket.blob(object_name)
+                blob.content_type = content_type
+                blob.cache_control = cache_control
+                blob.upload_from_filename(abs_path)
+                return
+            except Exception as exc:
+                if attempt == max_retries:
+                    raise
+                logger.warning(
+                    "Upload attempt %d/%d failed for %s: %s — retrying",
+                    attempt, max_retries, object_name, exc,
+                )
+                _time.sleep(2 ** attempt)
 
     @staticmethod
     def _detect_content_type(file_path: str) -> str:
