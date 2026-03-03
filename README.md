@@ -15,6 +15,7 @@ Plateforme de deploiement automatisee permettant aux equipes de deployer des sit
 - [Base de Donnees (Firestore)](#base-de-donnees-firestore)
 - [Validation IA](#validation-ia)
 - [Gestion des Domaines](#gestion-des-domaines)
+- [Authentification & Roles Utilisateurs](#authentification--roles-utilisateurs)
 - [Frontend React](#frontend-react)
 - [Statistiques & Rapports](#statistiques--rapports)
 - [Notifications Email](#notifications-email)
@@ -535,6 +536,87 @@ Si Claude est indisponible, le meme prompt est envoye a OpenRouter via le modele
 
 ---
 
+## Authentification & Roles Utilisateurs
+
+### Architecture Auth
+
+```
+                  Google Identity Services (GIS)
+                         │
+                    Google ID Token
+                         │
+                         ▼
+┌──────────────┐    POST /api/auth/google-signin    ┌──────────────────┐
+│   Frontend   │ ──────────────────────────────────► │    Backend       │
+│   React      │                                     │    FastAPI       │
+│              │ ◄────── Firebase Custom Token ───── │                  │
+│              │                                     │  1. Verifie le   │
+│  signInWith  │                                     │     Google token │
+│  CustomToken │                                     │  2. Get/Create   │
+│              │                                     │     Firebase user│
+│              │    GET /api/auth/me (Bearer token)  │  3. Cree Custom  │
+│              │ ──────────────────────────────────► │     Token        │
+│              │ ◄────── User Profile ────────────── │                  │
+└──────────────┘                                     └──────────────────┘
+```
+
+Le flux evite `signInWithPopup` de Firebase (et ses problemes de redirect URI) en passant par **Google Identity Services** cote client, puis en echangeant le token Google contre un **Firebase Custom Token** cote backend.
+
+### Roles et Permissions
+
+| Role | Deploiement Demo | Deploiement Prod | Deploiement Cloud Run | Gestion Utilisateurs |
+|------|:----------------:|:----------------:|:---------------------:|:--------------------:|
+| **simple_user** | Oui | Non | Non | Non |
+| **super_user** | Oui | Oui | Oui | Non |
+| **admin** | Oui | Oui | Oui | Oui |
+
+### Cycle de Vie Utilisateur
+
+```
+1. Sign-in Google (GIS) → Firebase Custom Token
+2. /signup → choisir role (simple_user ou super_user)
+3. Status = "pending" → email envoye a l'admin
+4. Admin approuve/rejette via email (lien avec token) ou via l'interface
+5. Status = "approved" → acces complet selon le role
+```
+
+### Endpoints Auth (`/api/auth`)
+
+| Methode | Endpoint | Description |
+|---------|----------|-------------|
+| `POST` | `/api/auth/google-signin` | Echange Google ID token → Firebase Custom Token |
+| `POST` | `/api/auth/signup` | Inscription (cree un compte pending) |
+| `GET` | `/api/auth/me` | Profil de l'utilisateur connecte |
+| `POST` | `/api/auth/approve/{uid}` | Approuver un utilisateur (admin ou token email) |
+| `POST` | `/api/auth/reject/{uid}` | Rejeter un utilisateur (admin ou token email) |
+| `GET` | `/api/auth/users` | Liste de tous les utilisateurs (admin only) |
+
+### Collection Firestore `users`
+
+| Champ | Type | Description |
+|-------|------|-------------|
+| `uid` (doc ID) | string | Firebase UID |
+| `email` | string | Email Google |
+| `display_name` | string | Nom complet |
+| `role` | string | admin / super_user / simple_user / null |
+| `status` | string | pending / approved / rejected |
+| `requested_role` | string | Role demande a l'inscription |
+| `created_at` | timestamp | Date d'inscription |
+| `approved_at` | timestamp | Date d'approbation |
+| `approved_by` | string | Qui a approuve |
+
+### Pages Frontend Auth
+
+| Route | Composant | Description |
+|-------|-----------|-------------|
+| `/login` | `Login.jsx` | Bouton Google Sign-In (GIS) |
+| `/signup` | `Signup.jsx` | Choix du role apres premiere connexion |
+| `/pending` | `Pending.jsx` | Page d'attente d'approbation |
+| `/auth/action` | `AuthAction.jsx` | Traitement des liens approve/reject par email |
+| `/admin/users` | `AdminUsers.jsx` | Gestion des utilisateurs (admin only) |
+
+---
+
 ## Gestion des Domaines
 
 ### Flux de Verification (Frontend)
@@ -556,19 +638,136 @@ SI checking   : ⏳ Spinner — verification en cours
 ### Verification Backend (3 niveaux)
 
 ```
-1. Cloud Domains registrations → domaine achete via Google ?
-2. Cloud DNS managed zones     → zone DNS dans le projet GCP ?
-3. Cloud Domains searchDomains → disponible a l'achat ?
+check_domain(domain)
+├── Niveau 1 : Cloud Domains registrations → "owned"
+│   (domaine achete via Google Cloud Domains)
+│
+├── Niveau 2 : Cloud DNS managed zones → "owned"
+│   (zone DNS existante dans le projet GCP, meme si achete ailleurs)
+│
+└── Niveau 3 : Cloud Domains searchDomains
+    ├── AVAILABLE → "available" (avec prix USD/an)
+    ├── NOT_AVAILABLE → "external" (deploiement autorise)
+    └── Erreur API → "external" (degradation gracieuse)
 ```
 
-### Configuration DNS Post-Deploiement
+> **Important** : Le statut `"external"` n'est **pas une erreur**. Le deploiement se poursuit normalement — seule la configuration DNS manuelle est requise apres.
 
-Apres un deploiement prod avec un domaine externe (GoDaddy, OVH, etc.), l'interface affiche :
+### Deploiement Production avec Domaine Externe (GoDaddy, OVH, Namecheap...)
 
-1. Les **nameservers Google Cloud DNS** dans un tableau avec boutons "Copier"
-2. Des **instructions pas a pas** pour configurer le registrar
-3. Un **lien vers dnschecker.org** pour verifier la propagation DNS
-4. Temps de propagation : 15 minutes a 48 heures
+Le mode prod supporte nativement les domaines achetes chez n'importe quel registrar externe. Voici le flux complet :
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  AVANT LE DEPLOIEMENT                                               │
+│                                                                     │
+│  1. L'utilisateur entre son domaine (ex: monsite.com)               │
+│  2. Le backend verifie → statut "external"                          │
+│  3. Message : "Domaine chez un registrar externe"                   │
+│  4. Le bouton Deployer est actif                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PENDANT LE DEPLOIEMENT (automatique)                               │
+│                                                                     │
+│  Le pipeline cree automatiquement :                                 │
+│  ✓ Bucket Cloud Storage (fichiers du site)                          │
+│  ✓ Backend Bucket avec CDN                                          │
+│  ✓ Host rule dans le load balancer partage (URL map)                │
+│  ✓ Certificat SSL Google-managed                                    │
+│  ✓ Zone Cloud DNS avec records A + CNAME (www)                      │
+│                                                                     │
+│  Toutes les operations sont IDEMPOTENTES :                          │
+│  → si une ressource existe deja, elle est reutilisee                │
+│  → un deploiement partiel peut etre relance sans probleme           │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  APRES LE DEPLOIEMENT (action manuelle requise)                     │
+│                                                                     │
+│  L'interface affiche un panneau "Configuration DNS requise" avec :  │
+│                                                                     │
+│  ┌────────────────────────────────────────────────┐                 │
+│  │  Nameservers Google Cloud DNS                   │                 │
+│  │  ┌────┬─────────────────────────────────┬─────┐│                 │
+│  │  │ #  │ Nameserver                      │ 📋 ││                 │
+│  │  ├────┼─────────────────────────────────┼─────┤│                 │
+│  │  │ 1  │ ns-cloud-a1.googledomains.com   │ 📋 ││                 │
+│  │  │ 2  │ ns-cloud-a2.googledomains.com   │ 📋 ││                 │
+│  │  │ 3  │ ns-cloud-a3.googledomains.com   │ 📋 ││                 │
+│  │  │ 4  │ ns-cloud-a4.googledomains.com   │ 📋 ││                 │
+│  │  └────┴─────────────────────────────────┴─────┘│                 │
+│  │                              [Tout copier]      │                 │
+│  └────────────────────────────────────────────────┘                 │
+│                                                                     │
+│  Instructions pas a pas :                                           │
+│  1. Connectez-vous a votre registrar (GoDaddy, OVH...)              │
+│  2. Trouvez les parametres DNS du domaine                           │
+│     GoDaddy : My Domains → {domaine} → DNS → Nameservers           │
+│  3. Changez en "Custom Nameservers"                                 │
+│  4. Remplacez les nameservers par ceux de Google ci-dessus          │
+│  5. Sauvegardez → propagation DNS : 15 min a 48 heures             │
+│                                                                     │
+│  Verification : lien vers dnschecker.org/#NS/{domaine}              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Exemple Concret : Deployer avec un Domaine GoDaddy
+
+```
+1. Upload ZIP + mode "Production" + domaine "monsite.com"
+2. Le backend detecte : domaine externe (enregistre chez GoDaddy)
+3. Pipeline s'execute → infra GCP creee (bucket, CDN, SSL, DNS zone)
+4. Resultat : panneau avec 4 nameservers Google
+
+5. Aller sur GoDaddy :
+   → My Domains → monsite.com → DNS → Nameservers
+   → Cliquer "Change" → "Enter my own nameservers (advanced)"
+   → Remplacer par :
+     ns-cloud-a1.googledomains.com
+     ns-cloud-a2.googledomains.com
+     ns-cloud-a3.googledomains.com
+     ns-cloud-a4.googledomains.com
+   → Save
+
+6. Attendre la propagation DNS (15 min - 48h)
+7. Le certificat SSL Google est provisionne automatiquement
+   une fois le DNS actif (peut prendre jusqu'a 24h)
+8. Le site est accessible sur https://monsite.com
+```
+
+### Idempotence du Deploiement Prod
+
+Chaque ressource est verifiee avant creation. Un re-deploiement est sans risque :
+
+| Ressource | Si existe deja | Action |
+|-----------|----------------|--------|
+| Bucket Storage | Skip creation | Fichiers ecrases par l'upload |
+| Backend Bucket (CDN) | Skip creation | Configuration preservee |
+| Host rule URL map | Skip si domaine deja present | Pas de doublon |
+| Certificat SSL | Skip si cert existe | Reutilise |
+| Zone DNS | Skip si zone existe | Records mis a jour si differents |
+
+### Retry & Backoff (URL Map)
+
+L'ajout de host rules dans l'URL map partage utilise un **retry avec backoff exponentiel** pour gerer les conflits de concurrence :
+
+```
+Tentative 1 → echec "resourceNotReady" → attente 5s
+Tentative 2 → echec "resourceNotReady" → attente 10s
+Tentative 3 → echec "resourceNotReady" → attente 20s
+Tentative 4 → echec "resourceNotReady" → attente 40s
+Tentative 5 → succes ou erreur finale
+```
+
+### Certificat SSL Google-Managed
+
+- **Type** : `MANAGED` (provisionne et renouvele automatiquement par Google)
+- **Limite** : 15 certificats maximum par proxy HTTPS
+- **Provisionnement** : quelques minutes a 24 heures (necessite que le DNS pointe vers l'IP Google)
+- **Verification** : le cert ne sera actif qu'une fois la propagation DNS terminee
 
 ---
 
@@ -836,6 +1035,9 @@ roles/run.admin
 roles/cloudbuild.builds.editor
 roles/artifactregistry.writer
 roles/iam.serviceAccountUser
+roles/iam.serviceAccountTokenCreator    # Firebase Custom Token creation
+roles/firebaseauth.admin                # Firebase Auth (get/create users)
+roles/datastore.user                    # Firestore read/write
 ```
 
 ---
@@ -900,6 +1102,7 @@ gcloud run deploy webdeploy-frontend \
 │   ├── api/
 │   │   ├── dependencies.py              # DI FastAPI + WebSocket broadcast
 │   │   └── routes/
+│   │       ├── auth.py                  # Google sign-in, signup, approve/reject
 │   │       ├── deployments.py           # CRUD deploiements + POST /deploy
 │   │       ├── domains.py               # Check + register domaines
 │   │       ├── health.py                # Health check
@@ -915,8 +1118,9 @@ gcloud run deploy webdeploy-frontend \
 │   │   ├── prod_deployer.py             # Deployer prod (LB partage, host-based)
 │   │   └── cloudrun_deployer.py         # Deployer Cloud Run (conteneurs)
 │   ├── models/
-│   │   ├── enums.py                     # Enumerations (modes, statuts, etapes)
-│   │   └── deployment.py                # Schemas Pydantic + records Firestore
+│   │   ├── enums.py                     # Enumerations (modes, statuts, etapes, roles)
+│   │   ├── deployment.py                # Schemas Pydantic + records Firestore
+│   │   └── user.py                      # Schemas utilisateur (UserCreate, UserResponse)
 │   ├── services/
 │   │   ├── pipeline_orchestrator.py     # Orchestrateur 9 etapes
 │   │   ├── zip_processor.py             # Extraction + validation ZIP
@@ -928,6 +1132,8 @@ gcloud run deploy webdeploy-frontend \
 │   │   ├── domain_service.py            # Check + achat domaines (Cloud Domains)
 │   │   ├── email_service.py             # Notifications Gmail API
 │   │   ├── daily_report_service.py      # Rapports periodiques schedules
+│   │   ├── firebase_auth.py             # Firebase Admin SDK init + token verification
+│   │   ├── approval_tokens.py           # Tokens HMAC pour approve/reject par email
 │   │   └── zip_backup.py               # Backup/restore ZIP vers GCS
 │   ├── config.py                        # Settings (pydantic-settings + .env)
 │   ├── main.py                          # Point d'entree FastAPI + lifecycle
@@ -935,8 +1141,13 @@ gcloud run deploy webdeploy-frontend \
 │   └── .env.example                     # Template de configuration
 ├── frontend/
 │   ├── src/
+│   │   ├── config/
+│   │   │   └── firebase.js              # Firebase SDK init (client-side)
+│   │   ├── contexts/
+│   │   │   └── AuthContext.jsx           # Auth state (Firebase + profil backend)
 │   │   ├── components/
 │   │   │   ├── Layout.jsx               # Navigation + layout
+│   │   │   ├── ProtectedRoute.jsx       # Route guard (auth + approval)
 │   │   │   ├── DeploymentForm.jsx       # Formulaire deploiement
 │   │   │   ├── UploadZone.jsx           # Upload ZIP/HTML/Dossier
 │   │   │   ├── DeploymentHistory.jsx    # Historique (tableau)
@@ -948,6 +1159,11 @@ gcloud run deploy webdeploy-frontend \
 │   │   │       ├── DeployerTable.jsx    # Tableau deployers
 │   │   │       └── SendReportPanel.jsx  # Modal envoi rapport
 │   │   ├── pages/
+│   │   │   ├── Login.jsx                # Google Sign-In (GIS)
+│   │   │   ├── Signup.jsx               # Choix du role
+│   │   │   ├── Pending.jsx              # Attente d'approbation
+│   │   │   ├── AuthAction.jsx           # Traitement liens approve/reject
+│   │   │   ├── AdminUsers.jsx           # Gestion utilisateurs (admin)
 │   │   │   ├── DeploymentDetail.jsx     # Vue pipeline + resultat
 │   │   │   └── Statistics.jsx           # Dashboard statistiques
 │   │   ├── hooks/
