@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   CheckCircle,
   XCircle,
@@ -5,6 +6,9 @@ import {
   Globe,
   Clock,
   Tag,
+  Copy,
+  Check,
+  Server,
 } from "lucide-react";
 
 /**
@@ -12,9 +16,11 @@ import {
  *
  * @param {{ deployment: object }} props
  *   deployment: { id, status, website_name, mode, url, domain, steps, ai_summary,
- *                 error_message, created_at, completed_at }
+ *                 error_message, created_at, completed_at, dns_nameservers }
  */
 export default function DeploymentStatus({ deployment }) {
+  const [copiedNs, setCopiedNs] = useState(null);
+
   if (!deployment) return null;
 
   const { status } = deployment;
@@ -30,6 +36,33 @@ export default function DeploymentStatus({ deployment }) {
     if (!dateStr) return "N/A";
     return new Date(dateStr).toLocaleString();
   };
+
+  const handleCopyNs = async (ns, idx) => {
+    try {
+      await navigator.clipboard.writeText(ns);
+      setCopiedNs(idx);
+      setTimeout(() => setCopiedNs(null), 2000);
+    } catch {
+      // Fallback for non-HTTPS
+    }
+  };
+
+  const handleCopyAll = async () => {
+    try {
+      const all = deployment.dns_nameservers.join("\n");
+      await navigator.clipboard.writeText(all);
+      setCopiedNs("all");
+      setTimeout(() => setCopiedNs(null), 2000);
+    } catch {
+      // Fallback for non-HTTPS
+    }
+  };
+
+  const showDnsInstructions =
+    isSuccess &&
+    deployment.mode === "prod" &&
+    deployment.dns_nameservers &&
+    deployment.dns_nameservers.length > 0;
 
   return (
     <div className="space-y-4">
@@ -102,6 +135,215 @@ export default function DeploymentStatus({ deployment }) {
           </div>
         </div>
       </div>
+
+      {/* DNS Configuration Instructions (prod mode with nameservers) */}
+      {showDnsInstructions && (
+        <div className="bg-white rounded-xl border-2 border-blue-200 overflow-hidden">
+          {/* Header */}
+          <div className="bg-blue-50 px-6 py-4 border-b border-blue-200">
+            <div className="flex items-center gap-3">
+              <Server className="w-5 h-5 text-blue-600" />
+              <h3 className="text-lg font-bold text-blue-900">
+                Configuration DNS requise
+              </h3>
+            </div>
+            <p className="mt-1 text-sm text-blue-700">
+              Pour que le domaine <strong>{deployment.domain}</strong> pointe
+              vers votre site, configurez les nameservers chez votre registrar.
+            </p>
+          </div>
+
+          <div className="p-6 space-y-6">
+            {/* Nameservers table */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-semibold text-gray-800">
+                  Nameservers Google Cloud DNS
+                </h4>
+                <button
+                  onClick={handleCopyAll}
+                  className="inline-flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800
+                    font-medium transition-colors"
+                >
+                  {copiedNs === "all" ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      Copi&eacute; !
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      Tout copier
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="border border-gray-200 rounded-lg overflow-hidden">
+                <table className="w-full">
+                  <thead>
+                    <tr className="bg-gray-50 border-b border-gray-200">
+                      <th className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        #
+                      </th>
+                      <th className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Nameserver
+                      </th>
+                      <th className="px-4 py-2.5 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Copier
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {deployment.dns_nameservers.map((ns, idx) => (
+                      <tr
+                        key={ns}
+                        className={`${
+                          idx % 2 === 0 ? "bg-white" : "bg-gray-50"
+                        } border-b border-gray-100 last:border-b-0`}
+                      >
+                        <td className="px-4 py-3 text-sm text-gray-400 font-mono">
+                          {idx + 1}
+                        </td>
+                        <td className="px-4 py-3 text-sm font-mono font-medium text-gray-900">
+                          {ns}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button
+                            onClick={() => handleCopyNs(ns, idx)}
+                            className="inline-flex items-center gap-1 text-xs text-gray-400
+                              hover:text-blue-600 transition-colors"
+                            title={`Copier ${ns}`}
+                          >
+                            {copiedNs === idx ? (
+                              <Check className="w-4 h-4 text-green-500" />
+                            ) : (
+                              <Copy className="w-4 h-4" />
+                            )}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Step-by-step instructions */}
+            <div>
+              <h4 className="text-sm font-semibold text-gray-800 mb-3">
+                &Eacute;tapes &agrave; suivre
+              </h4>
+              <ol className="space-y-3">
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-100 text-blue-700
+                    text-sm font-bold flex items-center justify-center">
+                    1
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Connectez-vous &agrave; votre registrar
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Allez sur le site de votre registrar (GoDaddy, OVH, Namecheap, etc.)
+                      et connectez-vous &agrave; votre compte.
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-100 text-blue-700
+                    text-sm font-bold flex items-center justify-center">
+                    2
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Trouvez les param&egrave;tres DNS du domaine
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Allez dans <strong>Domain Settings</strong> &rarr; <strong>DNS</strong> &rarr; <strong>Nameservers</strong>.
+                      Sur GoDaddy : My Domains &rarr; {deployment.domain} &rarr; DNS &rarr; Nameservers.
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-100 text-blue-700
+                    text-sm font-bold flex items-center justify-center">
+                    3
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Changez les nameservers en &laquo; Custom &raquo;
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      S&eacute;lectionnez <strong>&laquo; Custom Nameservers &raquo;</strong> (ou &laquo; Personnalis&eacute; &raquo;)
+                      et remplacez les nameservers existants par les {deployment.dns_nameservers.length} nameservers
+                      Google ci-dessus.
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-blue-100 text-blue-700
+                    text-sm font-bold flex items-center justify-center">
+                    4
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Sauvegardez et patientez
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Cliquez sur <strong>Save</strong>. La propagation DNS peut prendre
+                      entre <strong>15 minutes et 48 heures</strong>. Votre site sera
+                      accessible sur <strong>{deployment.url}</strong> une fois la
+                      propagation termin&eacute;e.
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-100 text-green-700
+                    text-sm font-bold flex items-center justify-center">
+                    5
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      V&eacute;rifiez que tout fonctionne
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Testez en ouvrant{" "}
+                      <a
+                        href={deployment.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-600 hover:underline"
+                      >
+                        {deployment.url}
+                      </a>{" "}
+                      dans votre navigateur. Si le certificat SSL est en attente,
+                      il sera automatiquement provisionn&eacute; par Google (jusqu&apos;&agrave; 24h).
+                    </p>
+                  </div>
+                </li>
+              </ol>
+            </div>
+
+            {/* Quick tip */}
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg">
+              <p className="text-xs text-amber-800">
+                <strong>Astuce :</strong> Pour v&eacute;rifier la propagation DNS,
+                utilisez{" "}
+                <a
+                  href={`https://dnschecker.org/#NS/${deployment.domain}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-amber-700 underline hover:text-amber-900"
+                >
+                  dnschecker.org
+                </a>
+                {" "}et v&eacute;rifiez que les nameservers Google apparaissent bien.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Metadata card */}
       <div className="bg-white rounded-xl border border-gray-200 p-6">

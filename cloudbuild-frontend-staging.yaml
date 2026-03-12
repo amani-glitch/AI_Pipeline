@@ -1,0 +1,26 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'europe-west1-docker.pkg.dev/adp-413110/cloud-run-images/webdeploy-frontend:staging'
+      - '-f'
+      - 'Dockerfile.frontend.prod'
+      - '--build-arg'
+      - 'VITE_FIREBASE_API_KEY=AIzaSyAw28LmXy8TF6Onj4Aob71VXylZ2MoFo4o'
+      - '--build-arg'
+      - 'VITE_FIREBASE_AUTH_DOMAIN=adp-413110.firebaseapp.com'
+      - '--build-arg'
+      - 'VITE_FIREBASE_PROJECT_ID=adp-413110'
+      - '--build-arg'
+      - 'VITE_FIREBASE_STORAGE_BUCKET=adp-413110.firebasestorage.app'
+      - '--build-arg'
+      - 'VITE_FIREBASE_MESSAGING_SENDER_ID=215323664878'
+      - '--build-arg'
+      - 'VITE_FIREBASE_APP_ID=1:215323664878:web:de7c81eb9817292be5eeff'
+      - '--build-arg'
+      - 'VITE_GOOGLE_CLIENT_ID=215323664878-260mrs9gdtvj9hnme9ktco7kagn2fq0e.apps.googleusercontent.com'
+      - '.'
+images:
+  - 'europe-west1-docker.pkg.dev/adp-413110/cloud-run-images/webdeploy-frontend:staging'
+timeout: 600s

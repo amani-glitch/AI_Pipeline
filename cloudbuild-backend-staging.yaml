@@ -1,0 +1,6 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'europe-west1-docker.pkg.dev/adp-413110/cloud-run-images/webdeploy-backend:staging', '-f', 'Dockerfile.backend.prod', '.']
+images:
+  - 'europe-west1-docker.pkg.dev/adp-413110/cloud-run-images/webdeploy-backend:staging'
+timeout: 600s

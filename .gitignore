@@ -8,6 +8,7 @@ venv
 # Sensitive Credentials
 service-account.json
 *-credentials.json
+adp-*.json
 *.pem
 *.key
 

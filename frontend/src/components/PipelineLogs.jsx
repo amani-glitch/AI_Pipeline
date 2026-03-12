@@ -15,6 +15,7 @@ const PIPELINE_STEPS = [
   { key: "AI_FIX", label: "AI Fix" },
   { key: "BUILD", label: "Build" },
   { key: "VERIFY", label: "Verify" },
+  { key: "DOMAIN_REGISTER", label: "Domain" },
   { key: "INFRA", label: "Infrastructure" },
   { key: "UPLOAD", label: "Upload" },
   { key: "NOTIFY", label: "Notify" },

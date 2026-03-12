@@ -205,6 +205,19 @@ CMD ["npm", "start"]
     @staticmethod
     def _template_static_vite(has_lockfile: bool = True) -> str:
         install_cmd = "RUN npm ci" if has_lockfile else "RUN npm install"
+        # Build the nginx printf as one line (\\n in Python → \n in output,
+        # which printf interprets as newline)
+        nginx_conf = (
+            "RUN printf 'server {\\n"
+            "    listen 8080;\\n"
+            "    server_name _;\\n"
+            "    root /usr/share/nginx/html;\\n"
+            "    index index.html;\\n"
+            "    location / {\\n"
+            "        try_files $uri $uri/ /index.html;\\n"
+            "    }\\n"
+            "}\\n' > /etc/nginx/conf.d/default.conf"
+        )
         return (
             "# Stage 1: Build\n"
             "FROM node:20-alpine AS build\n"
@@ -228,15 +241,7 @@ CMD ["npm", "start"]
             "COPY --from=build /app/dist /usr/share/nginx/html\n"
             "\n"
             "# nginx config for SPA + Cloud Run port\n"
-            "RUN printf 'server {\\\\n\\\n"
-            "    listen 8080;\\\\n\\\n"
-            "    server_name _;\\\\n\\\n"
-            "    root /usr/share/nginx/html;\\\\n\\\n"
-            "    index index.html;\\\\n\\\n"
-            "    location / {\\\\n\\\n"
-            "        try_files $uri $uri/ /index.html;\\\\n\\\n"
-            "    }\\\\n\\\n"
-            "}\\\\n' > /etc/nginx/conf.d/default.conf\n"
+            + nginx_conf + "\n"
             "\n"
             "ENV PORT=8080\n"
             "EXPOSE 8080\n"

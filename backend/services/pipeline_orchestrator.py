@@ -9,6 +9,7 @@ prior step has failed, so the user always receives an email notification.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -40,6 +41,7 @@ _PIPELINE_STEPS = [
     PipelineStep.AI_FIX,
     PipelineStep.BUILD,
     PipelineStep.VERIFY,
+    PipelineStep.DOMAIN_REGISTER,
     PipelineStep.INFRA,
     PipelineStep.UPLOAD,
     PipelineStep.NOTIFY,
@@ -83,7 +85,7 @@ class PipelineOrchestrator:
                 db,
                 deployment_id,
                 status=DeploymentStatus.FAILED.value,
-                error_message=f"Pipeline timed out after {timeout}s. The build may be too large or a step hung.",
+                error_message="Le déploiement a pris trop de temps et a été arrêté automatiquement. Veuillez relancer le déploiement.",
                 completed_at=datetime.now(timezone.utc),
             )
             log_cb = get_log_callback(deployment_id)
@@ -135,8 +137,36 @@ class PipelineOrchestrator:
                     )
                     continue
 
+                # ── DOMAIN_REGISTER: skip unless prod + confirmed + enabled ──
+                if step == PipelineStep.DOMAIN_REGISTER:
+                    is_prod = ctx.config.mode == DeploymentMode.PROD
+                    auto_register = self._settings.PROD_AUTO_REGISTER_DOMAINS
+                    confirmed = ctx.config.domain_purchase_confirmed
+                    if not (is_prod and auto_register and confirmed):
+                        crud.update_step_status(
+                            db, deployment_id, step.value, StepStatus.SKIPPED.value,
+                        )
+                        log_cb(
+                            "Achat de domaine non requis — étape ignorée",
+                            level=LogLevel.INFO.value, step=step.value,
+                        )
+                        continue
+
+                # ── AI_INSPECT / AI_FIX: skip when AI is disabled ────────
+                if step in (PipelineStep.AI_INSPECT, PipelineStep.AI_FIX):
+                    if not ctx.config.ai_enabled:
+                        crud.update_step_status(
+                            db, deployment_id, step.value, StepStatus.SKIPPED.value,
+                        )
+                        log_cb(
+                            "AI désactivé — étape ignorée",
+                            level=LogLevel.INFO.value, step=step.value,
+                        )
+                        continue
+
                 try:
                     await self._execute_step(db, ctx, step, log_cb)
+
                 except Exception as exc:
                     failed_step = step
                     failure_error = str(exc)
@@ -153,7 +183,6 @@ class PipelineOrchestrator:
                     crud.update_deployment_status(
                         db, deployment_id, error_message=failure_error,
                     )
-                    # Skip remaining steps to jump to NOTIFY (handled by loop logic)
 
             # ── Final status ──────────────────────────────────────
             if failed_step is not None:
@@ -227,6 +256,7 @@ class PipelineOrchestrator:
             PipelineStep.AI_FIX: self._step_ai_fix,
             PipelineStep.BUILD: self._step_build,
             PipelineStep.VERIFY: self._step_verify,
+            PipelineStep.DOMAIN_REGISTER: self._step_domain_register,
             PipelineStep.INFRA: self._step_infra,
             PipelineStep.UPLOAD: self._step_upload,
             PipelineStep.NOTIFY: self._step_notify,
@@ -285,6 +315,7 @@ class PipelineOrchestrator:
         ctx.package_json = result.package_json
         ctx.has_router = result.has_router
         ctx.is_static = result.is_static
+        ctx.main_html_file = result.main_html_file
 
     async def _step_ai_inspect(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.is_static:
@@ -310,6 +341,14 @@ class PipelineOrchestrator:
             has_router=ctx.has_router,
         )
         ctx.claude_summary = result.summary
+
+        # Store AI token usage for cost tracking
+        if result.token_usage:
+            ctx.ai_token_usage = result.token_usage
+            db = SessionLocal()
+            db.collection("deployments").document(ctx.deployment_id).update({
+                "ai_token_usage": json.dumps(ctx.ai_token_usage),
+            })
 
     async def _step_ai_fix(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.is_static:
@@ -393,13 +432,13 @@ class PipelineOrchestrator:
 
     async def _step_verify(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.is_static:
-            # For static sites, just verify index.html exists in dist_path
+            # For static sites, verify main HTML file exists in dist_path
             import os
-            index_path = os.path.join(ctx.dist_path, "index.html")
-            if not os.path.isfile(index_path):
-                raise RuntimeError(f"index.html not found at {ctx.dist_path}")
+            html_path = os.path.join(ctx.dist_path, ctx.main_html_file)
+            if not os.path.isfile(html_path):
+                raise RuntimeError(f"{ctx.main_html_file} not found at {ctx.dist_path}")
             log_cb(
-                "Static HTML site — verified index.html exists",
+                f"Static HTML site — verified {ctx.main_html_file} exists",
                 level=LogLevel.INFO.value,
                 step=PipelineStep.VERIFY.value,
             )
@@ -438,6 +477,32 @@ class PipelineOrchestrator:
             step=PipelineStep.VERIFY.value,
         )
 
+    async def _step_domain_register(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        """Purchase a domain via Cloud Domains API."""
+        from services.domain_service import DomainService
+
+        domain = ctx.config.domain
+        if not domain:
+            raise RuntimeError("Aucun domaine spécifié pour l'achat.")
+
+        log_cb(
+            f"Achat du domaine {domain} en cours...",
+            level=LogLevel.INFO.value,
+            step=PipelineStep.DOMAIN_REGISTER.value,
+        )
+
+        service = DomainService(self._settings)
+        result = await asyncio.to_thread(service.register_domain, domain)
+
+        if not result.success:
+            raise RuntimeError(result.message)
+
+        log_cb(
+            result.message,
+            level=LogLevel.INFO.value,
+            step=PipelineStep.DOMAIN_REGISTER.value,
+        )
+
     async def _step_infra(self, ctx: PipelineContext, log_cb: Callable) -> None:
         # The deployers expect an async log_callback(str).
         # Wrap the orchestrator's sync log_cb for compatibility.
@@ -448,7 +513,10 @@ class PipelineOrchestrator:
             from infra.demo_deployer import DemoDeployer
 
             deployer = DemoDeployer(config=self._settings, log_callback=_async_log)
-            result = await deployer.deploy(website_name=ctx.config.website_name)
+            result = await deployer.deploy(
+                website_name=ctx.config.website_name,
+                main_html_file=ctx.main_html_file,
+            )
 
         elif ctx.config.mode == DeploymentMode.CLOUDRUN:
             from infra.cloudrun_deployer import CloudRunDeployer
@@ -466,6 +534,7 @@ class PipelineOrchestrator:
             result = await deployer.deploy(
                 website_name=ctx.config.website_name,
                 domain=ctx.config.domain,
+                main_html_file=ctx.main_html_file,
             )
 
         if not result.success:
@@ -473,6 +542,14 @@ class PipelineOrchestrator:
 
         ctx.result_url = result.url
         ctx.bucket_name = result.storage_bucket
+
+        # Store DNS nameservers (for external domain instructions in UI)
+        if result.dns_nameservers:
+            ctx.dns_nameservers = result.dns_nameservers
+            db = SessionLocal()
+            db.collection("deployments").document(ctx.deployment_id).update({
+                "dns_nameservers": result.dns_nameservers,
+            })
 
     async def _step_upload(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.config.mode == DeploymentMode.CLOUDRUN:
@@ -566,6 +643,24 @@ class PipelineOrchestrator:
         if ctx.config.notification_emails:
             recipients.extend(ctx.config.notification_emails)
         recipients = list(set(r for r in recipients if r))
+
+        # Filter out users who disabled deployment notifications
+        if recipients:
+            try:
+                db = SessionLocal()
+                filtered = []
+                for email in recipients:
+                    # Look up user by querying all users (small collection)
+                    users_query = db.collection("users").where("email", "==", email).limit(1)
+                    docs = list(users_query.stream())
+                    if docs:
+                        prefs = (docs[0].to_dict() or {}).get("notification_preferences", {})
+                        if prefs and prefs.get("deployment_notifications") is False:
+                            continue
+                    filtered.append(email)
+                recipients = filtered
+            except Exception as exc:
+                logger.warning("Failed to check notification preferences: %s", exc)
 
         if not recipients:
             log_cb(

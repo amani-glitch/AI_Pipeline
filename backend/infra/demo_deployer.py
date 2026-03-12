@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable
 
 from google.cloud import storage as gcs
@@ -73,7 +74,7 @@ class DemoDeployer:
 
     # ─── public entry point ────────────────────────────────────────────
 
-    async def deploy(self, website_name: str) -> DeploymentResult:
+    async def deploy(self, website_name: str, main_html_file: str = "index.html") -> DeploymentResult:
         """Provision demo infrastructure for *website_name*.
 
         Returns a ``DeploymentResult`` with the public URL on success,
@@ -87,7 +88,7 @@ class DemoDeployer:
 
         try:
             # Step 1 — Storage bucket
-            await self._ensure_storage_bucket(bucket_name)
+            await self._ensure_storage_bucket(bucket_name, main_html_file)
 
             # Step 2 — Backend bucket (CDN)
             await self._ensure_backend_bucket(backend_bucket_name, bucket_name)
@@ -248,7 +249,7 @@ class DemoDeployer:
     #  Step 1 — Storage Bucket
     # =================================================================
 
-    async def _ensure_storage_bucket(self, bucket_name: str) -> None:
+    async def _ensure_storage_bucket(self, bucket_name: str, main_html_file: str = "index.html") -> None:
         """Create the Cloud Storage bucket if it does not already exist."""
         await self._emit(f"[INFRA] Checking storage bucket: {bucket_name}")
 
@@ -278,10 +279,10 @@ class DemoDeployer:
             ]
             bucket.create(location=self._config.BUCKET_LOCATION)
 
-            # Website configuration (SPA: index.html for both main and 404)
+            # Website configuration
             bucket.configure_website(
-                main_page_suffix="index.html",
-                not_found_page="index.html",
+                main_page_suffix=main_html_file,
+                not_found_page=main_html_file,
             )
             bucket.patch()
 
@@ -375,99 +376,123 @@ class DemoDeployer:
         )
 
         def _update() -> None:
-            # Fetch current URL map
-            url_map = (
-                self._compute.urlMaps()
-                .get(project=self._project_id, urlMap=url_map_name)
-                .execute()
-            )
+            max_retries = 5
+            base_delay = 5  # seconds
 
-            # Resolve the full self-link for the backend bucket
-            bb_resource = (
-                self._compute.backendBuckets()
-                .get(project=self._project_id, backendBucket=backend_bucket_name)
-                .execute()
-            )
-            bb_self_link = bb_resource["selfLink"]
-
-            desired_paths = [f"/{website_name}", f"/{website_name}/*"]
-
-            # Find the path matcher that handles the demo domain.
-            # The URL map has hostRules -> pathMatchers.  We locate the
-            # pathMatcher associated with the DEMO_DOMAIN host.
-            host_rules: list[dict] = url_map.get("hostRules", [])
-            target_matcher_name: str | None = None
-
-            for hr in host_rules:
-                hosts = hr.get("hosts", [])
-                if self._config.DEMO_DOMAIN in hosts:
-                    target_matcher_name = hr.get("pathMatcher")
-                    break
-
-            if target_matcher_name is None:
-                raise RuntimeError(
-                    f"No host rule for '{self._config.DEMO_DOMAIN}' found in "
-                    f"URL map '{url_map_name}'."
-                )
-
-            path_matchers: list[dict] = url_map.get("pathMatchers", [])
-            target_matcher: dict | None = None
-            for pm in path_matchers:
-                if pm.get("name") == target_matcher_name:
-                    target_matcher = pm
-                    break
-
-            if target_matcher is None:
-                raise RuntimeError(
-                    f"Path matcher '{target_matcher_name}' referenced by host "
-                    f"rule but not found in URL map '{url_map_name}'."
-                )
-
-            # Check for existing path rules that already cover our paths
-            existing_rules: list[dict] = target_matcher.get("pathRules", [])
-            existing_paths: set[str] = set()
-            for rule in existing_rules:
-                for p in rule.get("paths", []):
-                    existing_paths.add(p)
-
-            if all(p in existing_paths for p in desired_paths):
-                logger.info(
-                    "Path rules for %s already exist in URL map — skipping.",
-                    desired_paths,
-                )
-                return
-
-            # Remove any partial matches (in case only one path exists)
-            # and re-add the complete rule.
-            cleaned_rules = [
-                rule for rule in existing_rules
-                if not any(p in rule.get("paths", []) for p in desired_paths)
-            ]
-
-            new_rule: dict[str, Any] = {
-                "paths": desired_paths,
-                "service": bb_self_link,
-            }
-            cleaned_rules.append(new_rule)
-            target_matcher["pathRules"] = cleaned_rules
-
-            # Patch the URL map
-            operation = (
-                self._compute.urlMaps()
-                .patch(
-                    project=self._project_id,
-                    urlMap=url_map_name,
-                    body=url_map,
-                )
-                .execute()
-            )
-            wait_for_global_operation(
-                self._compute, self._project_id, operation["name"],
-            )
-            logger.info(
-                "URL map '%s' updated with paths %s -> %s",
-                url_map_name, desired_paths, backend_bucket_name,
-            )
+            for attempt in range(1, max_retries + 1):
+                try:
+                    self._patch_url_map(url_map_name, website_name, backend_bucket_name)
+                    return
+                except api_errors.HttpError as err:
+                    if err.resp.status == 400 and "resourceNotReady" in str(err):
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** (attempt - 1))  # 5, 10, 20, 40s
+                            logger.warning(
+                                "Backend bucket not ready (attempt %d/%d) — retrying in %ds...",
+                                attempt, max_retries, delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                    raise
 
         await self._run_sync(_update)
         await self._emit(f"[INFRA] URL map updated for /{website_name}")
+
+    def _patch_url_map(
+        self, url_map_name: str, website_name: str, backend_bucket_name: str,
+    ) -> None:
+        """Fetch the URL map, add path rules, and patch it back.
+
+        Extracted as a separate method so the retry loop in
+        ``_ensure_url_map_path_rule`` can call it cleanly.
+        """
+        # Fetch current URL map
+        url_map = (
+            self._compute.urlMaps()
+            .get(project=self._project_id, urlMap=url_map_name)
+            .execute()
+        )
+
+        # Resolve the full self-link for the backend bucket
+        bb_resource = (
+            self._compute.backendBuckets()
+            .get(project=self._project_id, backendBucket=backend_bucket_name)
+            .execute()
+        )
+        bb_self_link = bb_resource["selfLink"]
+
+        desired_paths = [f"/{website_name}", f"/{website_name}/*"]
+
+        # Find the path matcher that handles the demo domain.
+        host_rules: list[dict] = url_map.get("hostRules", [])
+        target_matcher_name: str | None = None
+
+        for hr in host_rules:
+            hosts = hr.get("hosts", [])
+            if self._config.DEMO_DOMAIN in hosts:
+                target_matcher_name = hr.get("pathMatcher")
+                break
+
+        if target_matcher_name is None:
+            raise RuntimeError(
+                f"No host rule for '{self._config.DEMO_DOMAIN}' found in "
+                f"URL map '{url_map_name}'."
+            )
+
+        path_matchers: list[dict] = url_map.get("pathMatchers", [])
+        target_matcher: dict | None = None
+        for pm in path_matchers:
+            if pm.get("name") == target_matcher_name:
+                target_matcher = pm
+                break
+
+        if target_matcher is None:
+            raise RuntimeError(
+                f"Path matcher '{target_matcher_name}' referenced by host "
+                f"rule but not found in URL map '{url_map_name}'."
+            )
+
+        # Check for existing path rules that already cover our paths
+        existing_rules: list[dict] = target_matcher.get("pathRules", [])
+        existing_paths: set[str] = set()
+        for rule in existing_rules:
+            for p in rule.get("paths", []):
+                existing_paths.add(p)
+
+        if all(p in existing_paths for p in desired_paths):
+            logger.info(
+                "Path rules for %s already exist in URL map — skipping.",
+                desired_paths,
+            )
+            return
+
+        # Remove any partial matches and re-add the complete rule.
+        cleaned_rules = [
+            rule for rule in existing_rules
+            if not any(p in rule.get("paths", []) for p in desired_paths)
+        ]
+
+        new_rule: dict[str, Any] = {
+            "paths": desired_paths,
+            "service": bb_self_link,
+        }
+        cleaned_rules.append(new_rule)
+        target_matcher["pathRules"] = cleaned_rules
+
+        # Patch the URL map
+        operation = (
+            self._compute.urlMaps()
+            .patch(
+                project=self._project_id,
+                urlMap=url_map_name,
+                body=url_map,
+            )
+            .execute()
+        )
+        wait_for_global_operation(
+            self._compute, self._project_id, operation["name"],
+        )
+        logger.info(
+            "URL map '%s' updated with paths %s -> %s",
+            url_map_name, desired_paths, backend_bucket_name,
+        )

@@ -70,6 +70,11 @@ class DeploymentConfig(BaseModel):
     website_name: str
     domain: Optional[str] = None
     notification_emails: list[str] = []
+    deployer_first_name: str = ""
+    deployer_last_name: str = ""
+    deployer_email: str = ""
+    ai_enabled: bool = False
+    domain_purchase_confirmed: bool = False
 
 
 class StepInfo(BaseModel):
@@ -93,6 +98,12 @@ class DeploymentResponse(BaseModel):
     error_message: Optional[str]
     notification_emails: Optional[str]
     zip_filename: Optional[str]
+    deployer_first_name: Optional[str] = None
+    deployer_last_name: Optional[str] = None
+    deployer_email: Optional[str] = None
+    ai_enabled: bool = False
+    ai_token_usage: Optional[str] = None
+    dns_nameservers: list[str] = []
     created_at: Optional[datetime]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -118,6 +129,12 @@ class DeploymentResponse(BaseModel):
             error_message=rec.error_message,
             notification_emails=rec.notification_emails,
             zip_filename=rec.zip_filename,
+            deployer_first_name=getattr(rec, "deployer_first_name", None),
+            deployer_last_name=getattr(rec, "deployer_last_name", None),
+            deployer_email=getattr(rec, "deployer_email", None),
+            ai_enabled=getattr(rec, "ai_enabled", False),
+            ai_token_usage=getattr(rec, "ai_token_usage", None),
+            dns_nameservers=getattr(rec, "dns_nameservers", []) or [],
             created_at=rec.created_at,
             started_at=rec.started_at,
             completed_at=rec.completed_at,
@@ -141,12 +158,15 @@ class PipelineContext(BaseModel):
     package_json: Optional[dict] = None
     has_router: bool = False
     is_static: bool = False
+    main_html_file: str = "index.html"
     claude_summary: Optional[str] = None
     result_url: Optional[str] = None
     bucket_name: Optional[str] = None
     project_type: Optional[str] = None
     docker_image_uri: Optional[str] = None
     cloudrun_service_name: Optional[str] = None
+    ai_token_usage: dict = {}
+    dns_nameservers: list[str] = []
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -158,6 +178,7 @@ class ZipProcessingResult(BaseModel):
     package_json: dict = {}
     has_router: bool = False
     is_static: bool = False
+    main_html_file: str = "index.html"
     detected_issues: list[str] = []
 
 
@@ -166,6 +187,7 @@ class ClaudeValidationResult(BaseModel):
     issues_found: list[dict] = []
     fixes: list[dict] = []
     summary: str = ""
+    token_usage: dict = {}
 
 
 class DeploymentResult(BaseModel):
@@ -178,6 +200,7 @@ class DeploymentResult(BaseModel):
     url_map_updated: bool = False
     cloudrun_service: Optional[str] = None
     docker_image: Optional[str] = None
+    dns_nameservers: list[str] = []
     error: Optional[str] = None
 
 

@@ -1,13 +1,42 @@
-import { NavLink, Outlet } from "react-router-dom";
-import { Rocket, Upload, History } from "lucide-react";
+import { useState, useEffect } from "react";
+import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import {
+  Rocket, Upload, History, BarChart3, Users, LogOut, Settings,
+  GitBranch, LayoutDashboard, Gauge, AlertTriangle
+} from "lucide-react";
+import { useAuth } from "../contexts/AuthContext";
+import { getUnresolvedAlertCount } from "../services/api";
 
 export default function Layout() {
+  const { firebaseUser, isAdmin, isSuperUser, signOut } = useAuth();
+  const navigate = useNavigate();
+  const [alertCount, setAlertCount] = useState(0);
+
+  // Fetch unresolved alert count for admin badge
+  useEffect(() => {
+    if (!isAdmin) return;
+    const fetch = async () => {
+      try {
+        const data = await getUnresolvedAlertCount();
+        setAlertCount(data.count || 0);
+      } catch {}
+    };
+    fetch();
+    const interval = setInterval(fetch, 30000);
+    return () => clearInterval(interval);
+  }, [isAdmin]);
+
   const linkClass = ({ isActive }) =>
     `flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
       isActive
         ? "bg-blue-700 text-white"
         : "text-blue-100 hover:bg-blue-600 hover:text-white"
     }`;
+
+  const handleSignOut = async () => {
+    await signOut();
+    navigate("/login");
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -24,15 +53,82 @@ export default function Layout() {
             </NavLink>
 
             {/* Navigation links */}
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1">
               <NavLink to="/" end className={linkClass}>
                 <Upload className="w-4 h-4" />
-                Deploy
+                <span className="hidden md:inline">Deploy</span>
               </NavLink>
               <NavLink to="/history" className={linkClass}>
                 <History className="w-4 h-4" />
-                History
+                <span className="hidden md:inline">History</span>
               </NavLink>
+              {(isSuperUser || isAdmin) && (
+                <NavLink to="/git" className={linkClass}>
+                  <GitBranch className="w-4 h-4" />
+                  <span className="hidden md:inline">Git</span>
+                </NavLink>
+              )}
+              <NavLink to="/settings" className={linkClass}>
+                <Settings className="w-4 h-4" />
+                <span className="hidden lg:inline">Notifications</span>
+              </NavLink>
+              {isAdmin && (
+                <>
+                  <NavLink to="/admin/dashboard" className={linkClass}>
+                    <LayoutDashboard className="w-4 h-4" />
+                    <span className="hidden md:inline">Dashboard</span>
+                    {alertCount > 0 && (
+                      <span className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-red-500 text-white rounded-full leading-none">
+                        {alertCount}
+                      </span>
+                    )}
+                  </NavLink>
+                  <NavLink to="/statistics" className={linkClass}>
+                    <BarChart3 className="w-4 h-4" />
+                    <span className="hidden md:inline">Stats</span>
+                  </NavLink>
+                  <NavLink to="/admin/users" className={linkClass}>
+                    <Users className="w-4 h-4" />
+                    <span className="hidden md:inline">Users</span>
+                  </NavLink>
+                  <NavLink to="/admin/quotas" className={linkClass}>
+                    <Gauge className="w-4 h-4" />
+                    <span className="hidden md:inline">Quotas</span>
+                  </NavLink>
+                </>
+              )}
+            </div>
+
+            {/* User info + sign out */}
+            <div className="flex items-center gap-3">
+              {firebaseUser && (
+                <div className="flex items-center gap-2">
+                  {firebaseUser.photoURL ? (
+                    <img
+                      src={firebaseUser.photoURL}
+                      alt="Avatar"
+                      className="w-8 h-8 rounded-full border-2 border-white/30"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : (
+                    <div className="w-8 h-8 rounded-full bg-blue-800 flex items-center justify-center text-white text-sm font-bold">
+                      {(firebaseUser.displayName || firebaseUser.email || "?")[0].toUpperCase()}
+                    </div>
+                  )}
+                  <span className="text-sm text-blue-100 hidden sm:inline">
+                    {firebaseUser.displayName || firebaseUser.email}
+                  </span>
+                </div>
+              )}
+              <button
+                onClick={handleSignOut}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium
+                  text-blue-100 hover:bg-blue-600 hover:text-white transition-colors cursor-pointer"
+                title="Se deconnecter"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="hidden sm:inline">Deconnexion</span>
+              </button>
             </div>
           </div>
         </div>

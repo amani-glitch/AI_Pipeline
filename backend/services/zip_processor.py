@@ -180,16 +180,17 @@ class ZipProcessingService:
         source_root = self._unwrap_single_folder(extract_dir)
         self._log(f"Project root resolved to: {source_root}", level="INFO", step="EXTRACT")
 
-        # Find index.html — at root or up to 2 levels deep
-        index_dir = self._find_index_html_dir(source_root)
-        if index_dir is None:
+        # Find HTML files — prefer index.html, fall back to any .html file
+        result = self._find_index_html_dir(source_root)
+        if result is None:
             raise ValueError(
-                "Cannot proceed: no index.html found in the uploaded ZIP. "
-                "Ensure the ZIP contains a valid HTML website with an index.html file."
+                "Cannot proceed: no HTML file found in the uploaded ZIP. "
+                "Ensure the ZIP contains at least one .html file."
             )
 
+        index_dir, main_html = result
         self._log(
-            f"Static site detected — using {index_dir} as deployment root",
+            f"Static site detected — using {index_dir} as deployment root (entry: {main_html})",
             level="INFO",
             step="EXTRACT",
         )
@@ -201,16 +202,20 @@ class ZipProcessingService:
             package_json={},
             has_router=False,
             is_static=True,
+            main_html_file=main_html,
             detected_issues=[],
         )
 
-    def _find_index_html_dir(self, root: str) -> Optional[str]:
-        """Find the directory containing index.html, preferring the root level."""
-        # Check root first
+    def _find_index_html_dir(self, root: str) -> Optional[tuple[str, str]]:
+        """Find the directory containing index.html, preferring the root level.
+        Falls back to any directory containing at least one .html file.
+        Returns (directory, html_filename) or None."""
+        # Check root first for index.html
         if os.path.isfile(os.path.join(root, "index.html")):
-            return root
+            return root, "index.html"
 
-        # Search up to 2 levels deep
+        # Search up to 2 levels deep for index.html
+        fallback: Optional[tuple[str, str]] = None
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [
                 d for d in dirnames
@@ -221,8 +226,14 @@ class ZipProcessingService:
                 dirnames.clear()
                 continue
             if "index.html" in filenames:
-                return dirpath
-        return None
+                return dirpath, "index.html"
+            # Track first directory with any .html file as fallback
+            if fallback is None:
+                html_files = [f for f in filenames if f.endswith(".html")]
+                if html_files:
+                    fallback = (dirpath, html_files[0])
+
+        return fallback
 
     # Marker files that identify a deployable project root for Cloud Run
     _PROJECT_MARKERS = (

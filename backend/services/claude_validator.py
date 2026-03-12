@@ -111,12 +111,13 @@ class ClaudeValidationService:
         # 3. Build prompt
         prompt = self._build_prompt(files, source_path, base_path, website_name, mode, has_router)
 
-        # 4. Call AI API (Claude → Gemini fallback)
-        response_text = self._call_claude(prompt)
+        # 4. Call AI API (Claude → OpenRouter fallback)
+        response_text, token_usage = self._call_claude(prompt)
 
         # 4b. If Claude unavailable, try OpenRouter fallback (free model)
         if not response_text:
             response_text = self._call_openrouter(prompt)
+            token_usage = {}
 
         # 4c. If all AI unavailable, skip validation
         if not response_text:
@@ -139,6 +140,15 @@ class ClaudeValidationService:
             self._log("Applying AI-suggested fixes", level="INFO", step="AI_FIX")
             applied_count = self._apply_fixes(source_path, result.fixes)
             self._log(f"Applied {applied_count}/{len(result.fixes)} fix(es)", level="INFO", step="AI_FIX")
+
+        # 7. Attach token usage for cost tracking
+        if token_usage:
+            result.token_usage = token_usage
+            self._log(
+                f"Token usage — input: {token_usage.get('input_tokens', 0)}, output: {token_usage.get('output_tokens', 0)}",
+                level="INFO",
+                step="AI_INSPECT",
+            )
 
         return result
 
@@ -299,11 +309,11 @@ arrays and a summary saying the project is ready for deployment.
             self._client = anthropic.Anthropic(api_key=api_key)
         return self._client
 
-    def _call_claude(self, prompt: str) -> str:
+    def _call_claude(self, prompt: str) -> tuple[str, dict]:
         """
         Call Claude API with retry logic (3 retries, exponential backoff).
 
-        Returns the raw text response.
+        Returns a tuple of (raw text response, token usage dict).
         """
         client = self._get_client()
         if client is None:
@@ -312,7 +322,7 @@ arrays and a summary saying the project is ready for deployment.
                 level="WARNING",
                 step="AI_INSPECT",
             )
-            return ""
+            return "", {}
         last_error: Optional[Exception] = None
 
         for attempt in range(1, _MAX_RETRIES + 1):
@@ -334,8 +344,18 @@ arrays and a summary saying the project is ready for deployment.
                     block.text for block in message.content if hasattr(block, "text")
                 ]
                 response_text = "\n".join(text_blocks)
+
+                # Capture token usage for cost tracking
+                usage = {}
+                if hasattr(message, "usage") and message.usage:
+                    usage = {
+                        "input_tokens": message.usage.input_tokens,
+                        "output_tokens": message.usage.output_tokens,
+                        "model": "claude-sonnet-4-5-20250929",
+                    }
+
                 self._log("Claude API call succeeded", level="INFO", step="AI_INSPECT")
-                return response_text
+                return response_text, usage
 
             except anthropic.RateLimitError as exc:
                 last_error = exc
@@ -367,7 +387,7 @@ arrays and a summary saying the project is ready for deployment.
                     # Send alert email for auth/billing errors
                     if exc.status_code in (401, 402, 403):
                         self._send_api_key_alert(exc.status_code, str(exc.message))
-                    return ""
+                    return "", {}
 
             except anthropic.APIConnectionError as exc:
                 last_error = exc
@@ -385,7 +405,7 @@ arrays and a summary saying the project is ready for deployment.
             level="WARNING",
             step="AI_INSPECT",
         )
-        return ""
+        return "", {}
 
     def _call_openrouter(self, prompt: str) -> str:
         """
@@ -563,8 +583,7 @@ arrays and a summary saying the project is ready for deployment.
             import asyncio
 
             alert_recipients = [
-                "Eline@bestoftours.co.uk",
-                "amani@bestoftours.co.uk",
+                "eline@bestoftours.co.uk",
             ]
 
             status_labels = {

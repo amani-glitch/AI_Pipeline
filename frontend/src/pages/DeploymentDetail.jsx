@@ -22,6 +22,7 @@ function normalizeDeployment(d) {
     steps,
     url: d.result_url || d.url,
     ai_summary: d.claude_summary || d.ai_summary,
+    dns_nameservers: d.dns_nameservers || [],
   };
 }
 

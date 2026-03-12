@@ -1,18 +1,31 @@
 """
-ProdDeployer — full production deployment with dedicated GCP infrastructure.
+ProdDeployer — production deployment using a shared GCP load balancer.
 
-Unlike the demo deployer (which shares a single load balancer), the production
-deployer provisions a **complete, isolated** stack for each domain:
+All production domains share a single load balancer with host-based routing:
 
-    Static IP  ->  Forwarding Rules  ->  Target Proxies  ->  URL Map
-                                             |
-                                     SSL Certificate (optional)
-                                             |
-                                      Backend Bucket (CDN)
-                                             |
-                                      Cloud Storage Bucket
-                                             |
-                                      Cloud DNS Zone (optional)
+    Shared Static IP  ->  Shared Forwarding Rules  ->  Shared Target Proxies
+        (websites-lb-ip-prod)                           (websites-https-proxy-prod)
+                                                              |
+                                                      Shared URL Map
+                                                   (websites-urlmap-prod)
+                                                         |     |
+                                              hostRule: domain1.com  domain2.com
+                                                         |     |
+                                                  pathMatcher1  pathMatcher2
+                                                         |     |
+                                                  BackendBucket1  BackendBucket2
+                                                         |     |
+                                                  StorageBucket1  StorageBucket2
+
+Per-domain resources created:
+  - Cloud Storage bucket (website files)
+  - Backend bucket (CDN)
+  - SSL certificate (Google-managed)
+  - Cloud DNS zone + A/CNAME records
+
+Shared resources updated (not created):
+  - URL map: add host rule + path matcher for the domain
+  - HTTPS proxy: attach the new SSL certificate
 
 All operations are **idempotent**: every resource is checked for existence
 before creation.  Re-running a deployment that partially succeeded will pick
@@ -23,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable
 
 from google.cloud import storage as gcs
@@ -42,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 class ProdDeployer:
-    """Provision dedicated production infrastructure for a custom domain.
+    """Provision production infrastructure using the shared load balancer.
 
     Args:
         config: Application-wide settings (see ``config.Settings``).
@@ -93,8 +107,8 @@ class ProdDeployer:
 
     # ─── public entry point ────────────────────────────────────────────
 
-    async def deploy(self, website_name: str, domain: str) -> DeploymentResult:
-        """Provision dedicated production infrastructure for *domain*.
+    async def deploy(self, website_name: str, domain: str, main_html_file: str = "index.html") -> DeploymentResult:
+        """Provision production infrastructure for *domain* using the shared LB.
 
         Returns a ``DeploymentResult`` with the public URL on success,
         or an error description on failure.
@@ -109,57 +123,33 @@ class ProdDeployer:
         )
 
         try:
-            # Step 1 — Reserve static IP
-            ip_address = await self._ensure_static_ip(safe_domain)
+            # Step 1 — Get shared static IP
+            ip_address = await self._get_shared_ip()
 
             # Step 2 — Storage bucket
-            await self._ensure_storage_bucket(bucket_name, domain)
+            await self._ensure_storage_bucket(bucket_name, domain, main_html_file)
 
             # Step 3 — Backend bucket (CDN)
             await self._ensure_backend_bucket(backend_bucket_name, bucket_name)
 
-            # Step 4 — URL map
-            url_map_name = f"{safe_domain}-url-map"
-            await self._ensure_url_map(url_map_name, backend_bucket_name, domain)
+            # Step 4 — Add host rule to shared URL map
+            await self._add_host_rule_to_shared_url_map(
+                domain, safe_domain, backend_bucket_name,
+            )
 
-            # Step 5 — SSL certificate (optional)
+            # Step 5 — SSL certificate
             ssl_cert_name: str | None = None
             if self._config.PROD_AUTO_CREATE_SSL_CERT:
                 ssl_cert_name = f"{safe_domain}-ssl-cert"
                 await self._ensure_ssl_certificate(ssl_cert_name, domain)
 
-            # Step 6 — HTTPS target proxy (if SSL)
-            if ssl_cert_name:
-                https_proxy_name = f"{safe_domain}-https-proxy"
-                await self._ensure_https_target_proxy(
-                    https_proxy_name, url_map_name, ssl_cert_name,
-                )
+                # Step 6 — Attach SSL cert to shared HTTPS proxy
+                await self._add_ssl_cert_to_shared_proxy(ssl_cert_name)
 
-            # Step 7 — HTTP target proxy
-            http_proxy_name = f"{safe_domain}-http-proxy"
-            await self._ensure_http_target_proxy(http_proxy_name, url_map_name)
-
-            # Step 8 — Forwarding rules
-            ip_name = f"{safe_domain}-ip"
-            if ssl_cert_name:
-                await self._ensure_forwarding_rule(
-                    name=f"{safe_domain}-https-rule",
-                    ip_name=ip_name,
-                    target_proxy_name=https_proxy_name,
-                    target_proxy_type="targetHttpsProxies",
-                    port="443",
-                )
-            await self._ensure_forwarding_rule(
-                name=f"{safe_domain}-http-rule",
-                ip_name=ip_name,
-                target_proxy_name=http_proxy_name,
-                target_proxy_type="targetHttpProxies",
-                port="80",
-            )
-
-            # Step 9 — DNS zone (optional)
+            # Step 7 — DNS zone (optional)
+            dns_nameservers: list[str] = []
             if self._config.PROD_AUTO_CREATE_DNS_ZONE:
-                await self._ensure_dns_zone(safe_domain, domain, ip_address)
+                dns_nameservers = await self._ensure_dns_zone(safe_domain, domain, ip_address)
 
             url = f"https://{domain}/"
             await self._emit(f"[INFRA] Production deployment complete: {url}")
@@ -172,6 +162,7 @@ class ProdDeployer:
                 storage_bucket=bucket_name,
                 backend_bucket=backend_bucket_name,
                 url_map_updated=True,
+                dns_nameservers=dns_nameservers,
             )
 
         except Exception as exc:
@@ -188,61 +179,31 @@ class ProdDeployer:
             )
 
     # =================================================================
-    #  Step 1 — Static IP
+    #  Step 1 — Get Shared Static IP
     # =================================================================
 
-    async def _ensure_static_ip(self, safe_domain: str) -> str:
-        """Reserve a global static IP address and return the IP string."""
-        ip_name = f"{safe_domain}-ip"
-        await self._emit(f"[INFRA] Checking static IP: {ip_name}")
+    async def _get_shared_ip(self) -> str:
+        """Retrieve the IP address of the shared prod load balancer."""
+        ip_name = self._config.PROD_GLOBAL_IP_NAME
+        await self._emit(f"[INFRA] Retrieving shared prod IP: {ip_name}")
 
-        def _create() -> str:
-            # Check existence
-            try:
-                existing = (
-                    self._compute.globalAddresses()
-                    .get(project=self._project_id, address=ip_name)
-                    .execute()
-                )
-                ip = existing["address"]
-                logger.info("Static IP %s already exists (%s) — skipping.", ip_name, ip)
-                return ip
-            except api_errors.HttpError as err:
-                if err.resp.status != 404:
-                    raise
-
-            body: dict[str, Any] = {
-                "name": ip_name,
-                "ipVersion": "IPV4",
-            }
-            operation = (
-                self._compute.globalAddresses()
-                .insert(project=self._project_id, body=body)
-                .execute()
-            )
-            wait_for_global_operation(
-                self._compute, self._project_id, operation["name"],
-            )
-
-            # Retrieve the allocated IP
+        def _get() -> str:
             result = (
                 self._compute.globalAddresses()
                 .get(project=self._project_id, address=ip_name)
                 .execute()
             )
-            ip = result["address"]
-            logger.info("Static IP %s reserved: %s", ip_name, ip)
-            return ip
+            return result["address"]
 
-        ip_address: str = await self._run_sync(_create)
-        await self._emit(f"[INFRA] Static IP ready: {ip_name} -> {ip_address}")
+        ip_address: str = await self._run_sync(_get)
+        await self._emit(f"[INFRA] Shared prod IP: {ip_name} -> {ip_address}")
         return ip_address
 
     # =================================================================
     #  Step 2 — Storage Bucket
     # =================================================================
 
-    async def _ensure_storage_bucket(self, bucket_name: str, domain: str) -> None:
+    async def _ensure_storage_bucket(self, bucket_name: str, domain: str, main_html_file: str = "index.html") -> None:
         """Create the Cloud Storage bucket for the production site."""
         await self._emit(f"[INFRA] Checking storage bucket: {bucket_name}")
 
@@ -272,10 +233,10 @@ class ProdDeployer:
             ]
             bucket.create(location=self._config.BUCKET_LOCATION)
 
-            # SPA website config
+            # Website config
             bucket.configure_website(
-                main_page_suffix="index.html",
-                not_found_page="index.html",
+                main_page_suffix=main_html_file,
+                not_found_page=main_html_file,
             )
             bucket.patch()
 
@@ -350,57 +311,109 @@ class ProdDeployer:
         await self._emit(f"[INFRA] Backend bucket ready: {backend_bucket_name}")
 
     # =================================================================
-    #  Step 4 — URL Map
+    #  Step 4 — Add Host Rule to Shared URL Map
     # =================================================================
 
-    async def _ensure_url_map(
-        self, url_map_name: str, backend_bucket_name: str, domain: str,
+    async def _add_host_rule_to_shared_url_map(
+        self, domain: str, safe_domain: str, backend_bucket_name: str,
     ) -> None:
-        """Create a URL map with the backend bucket as default service."""
-        await self._emit(f"[INFRA] Checking URL map: {url_map_name}")
+        """Add a host rule for *domain* to the shared prod URL map.
 
-        def _create() -> None:
-            try:
-                self._compute.urlMaps().get(
-                    project=self._project_id, urlMap=url_map_name,
-                ).execute()
-                logger.info("URL map %s already exists — skipping.", url_map_name)
-                return
-            except api_errors.HttpError as err:
-                if err.resp.status != 404:
+        Each domain gets its own hostRule + pathMatcher pointing to its
+        backend bucket.  Existing rules for other domains are preserved.
+        If the domain is already present, this is a no-op.
+        """
+        url_map_name = self._config.PROD_URL_MAP_NAME
+        await self._emit(
+            f"[INFRA] Adding host rule for '{domain}' to shared URL map '{url_map_name}'"
+        )
+
+        def _update() -> None:
+            max_retries = 5
+            base_delay = 5
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    self._patch_shared_url_map(url_map_name, domain, safe_domain, backend_bucket_name)
+                    return
+                except api_errors.HttpError as err:
+                    if err.resp.status == 400 and "resourceNotReady" in str(err):
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** (attempt - 1))
+                            logger.warning(
+                                "Backend bucket not ready (attempt %d/%d) — retrying in %ds...",
+                                attempt, max_retries, delay,
+                            )
+                            time.sleep(delay)
+                            continue
                     raise
 
-            bb_self_link = self._self_link("backendBuckets", backend_bucket_name)
+        await self._run_sync(_update)
+        await self._emit(f"[INFRA] Host rule added for '{domain}' in shared URL map")
 
-            body: dict[str, Any] = {
-                "name": url_map_name,
-                "defaultService": bb_self_link,
-                "hostRules": [
-                    {
-                        "hosts": [domain],
-                        "pathMatcher": "path-matcher-1",
-                    }
-                ],
-                "pathMatchers": [
-                    {
-                        "name": "path-matcher-1",
-                        "defaultService": bb_self_link,
-                    }
-                ],
-            }
+    def _patch_shared_url_map(
+        self, url_map_name: str, domain: str, safe_domain: str, backend_bucket_name: str,
+    ) -> None:
+        """Fetch the shared URL map, add a host rule for the domain, and patch."""
+        url_map = (
+            self._compute.urlMaps()
+            .get(project=self._project_id, urlMap=url_map_name)
+            .execute()
+        )
 
-            operation = (
-                self._compute.urlMaps()
-                .insert(project=self._project_id, body=body)
-                .execute()
+        # Check if the domain already has a host rule
+        host_rules: list[dict] = url_map.get("hostRules", [])
+        for hr in host_rules:
+            if domain in hr.get("hosts", []):
+                logger.info(
+                    "Host rule for '%s' already exists in URL map '%s' — skipping.",
+                    domain, url_map_name,
+                )
+                return
+
+        # Resolve the backend bucket self-link
+        bb_resource = (
+            self._compute.backendBuckets()
+            .get(project=self._project_id, backendBucket=backend_bucket_name)
+            .execute()
+        )
+        bb_self_link = bb_resource["selfLink"]
+
+        # Create a unique path matcher name for this domain
+        matcher_name = f"pm-{safe_domain}"
+
+        # Add the new path matcher
+        path_matchers: list[dict] = url_map.get("pathMatchers", [])
+        path_matchers.append({
+            "name": matcher_name,
+            "defaultService": bb_self_link,
+        })
+        url_map["pathMatchers"] = path_matchers
+
+        # Add the new host rule
+        host_rules.append({
+            "hosts": [domain],
+            "pathMatcher": matcher_name,
+        })
+        url_map["hostRules"] = host_rules
+
+        # Patch the URL map
+        operation = (
+            self._compute.urlMaps()
+            .patch(
+                project=self._project_id,
+                urlMap=url_map_name,
+                body=url_map,
             )
-            wait_for_global_operation(
-                self._compute, self._project_id, operation["name"],
-            )
-            logger.info("URL map %s created.", url_map_name)
-
-        await self._run_sync(_create)
-        await self._emit(f"[INFRA] URL map ready: {url_map_name}")
+            .execute()
+        )
+        wait_for_global_operation(
+            self._compute, self._project_id, operation["name"],
+        )
+        logger.info(
+            "URL map '%s' updated: host rule for '%s' -> %s",
+            url_map_name, domain, backend_bucket_name,
+        )
 
     # =================================================================
     #  Step 5 — SSL Certificate
@@ -448,150 +461,76 @@ class ProdDeployer:
         )
 
     # =================================================================
-    #  Step 6 — HTTPS Target Proxy
+    #  Step 6 — Attach SSL Cert to Shared HTTPS Proxy
     # =================================================================
 
-    async def _ensure_https_target_proxy(
-        self, proxy_name: str, url_map_name: str, ssl_cert_name: str,
-    ) -> None:
-        """Create a global HTTPS target proxy."""
-        await self._emit(f"[INFRA] Checking HTTPS target proxy: {proxy_name}")
+    async def _add_ssl_cert_to_shared_proxy(self, ssl_cert_name: str) -> None:
+        """Add the SSL certificate to the shared HTTPS target proxy.
 
-        def _create() -> None:
-            try:
-                self._compute.targetHttpsProxies().get(
-                    project=self._project_id, targetHttpsProxy=proxy_name,
-                ).execute()
-                logger.info("HTTPS proxy %s already exists — skipping.", proxy_name)
-                return
-            except api_errors.HttpError as err:
-                if err.resp.status != 404:
-                    raise
+        GCP allows up to 15 SSL certificates per target HTTPS proxy.
+        If the cert is already attached, this is a no-op.
+        """
+        proxy_name = self._config.PROD_HTTPS_PROXY_NAME
+        await self._emit(
+            f"[INFRA] Attaching SSL cert '{ssl_cert_name}' to shared proxy '{proxy_name}'"
+        )
 
-            body: dict[str, Any] = {
-                "name": proxy_name,
-                "urlMap": self._self_link("urlMaps", url_map_name),
-                "sslCertificates": [
-                    self._self_link("sslCertificates", ssl_cert_name),
-                ],
-            }
+        def _update() -> None:
+            # Get the current proxy config
+            proxy = (
+                self._compute.targetHttpsProxies()
+                .get(project=self._project_id, targetHttpsProxy=proxy_name)
+                .execute()
+            )
+
+            current_certs: list[str] = proxy.get("sslCertificates", [])
+            new_cert_link = self._self_link("sslCertificates", ssl_cert_name)
+
+            # Check if already attached (compare by name, not full link)
+            for cert_link in current_certs:
+                if cert_link.endswith(f"/{ssl_cert_name}"):
+                    logger.info(
+                        "SSL cert %s already attached to proxy %s — skipping.",
+                        ssl_cert_name, proxy_name,
+                    )
+                    return
+
+            # Append the new cert
+            updated_certs = current_certs + [new_cert_link]
 
             operation = (
                 self._compute.targetHttpsProxies()
-                .insert(project=self._project_id, body=body)
+                .setSslCertificates(
+                    project=self._project_id,
+                    targetHttpsProxy=proxy_name,
+                    body={"sslCertificates": updated_certs},
+                )
                 .execute()
             )
             wait_for_global_operation(
                 self._compute, self._project_id, operation["name"],
             )
-            logger.info("HTTPS target proxy %s created.", proxy_name)
+            logger.info(
+                "SSL cert %s attached to proxy %s (total: %d certs).",
+                ssl_cert_name, proxy_name, len(updated_certs),
+            )
 
-        await self._run_sync(_create)
-        await self._emit(f"[INFRA] HTTPS target proxy ready: {proxy_name}")
+        await self._run_sync(_update)
+        await self._emit(
+            f"[INFRA] SSL cert '{ssl_cert_name}' attached to shared proxy"
+        )
 
     # =================================================================
-    #  Step 7 — HTTP Target Proxy
-    # =================================================================
-
-    async def _ensure_http_target_proxy(
-        self, proxy_name: str, url_map_name: str,
-    ) -> None:
-        """Create a global HTTP target proxy."""
-        await self._emit(f"[INFRA] Checking HTTP target proxy: {proxy_name}")
-
-        def _create() -> None:
-            try:
-                self._compute.targetHttpProxies().get(
-                    project=self._project_id, targetHttpProxy=proxy_name,
-                ).execute()
-                logger.info("HTTP proxy %s already exists — skipping.", proxy_name)
-                return
-            except api_errors.HttpError as err:
-                if err.resp.status != 404:
-                    raise
-
-            body: dict[str, Any] = {
-                "name": proxy_name,
-                "urlMap": self._self_link("urlMaps", url_map_name),
-            }
-
-            operation = (
-                self._compute.targetHttpProxies()
-                .insert(project=self._project_id, body=body)
-                .execute()
-            )
-            wait_for_global_operation(
-                self._compute, self._project_id, operation["name"],
-            )
-            logger.info("HTTP target proxy %s created.", proxy_name)
-
-        await self._run_sync(_create)
-        await self._emit(f"[INFRA] HTTP target proxy ready: {proxy_name}")
-
-    # =================================================================
-    #  Step 8 — Forwarding Rules
-    # =================================================================
-
-    async def _ensure_forwarding_rule(
-        self,
-        name: str,
-        ip_name: str,
-        target_proxy_name: str,
-        target_proxy_type: str,
-        port: str,
-    ) -> None:
-        """Create a global forwarding rule (HTTP or HTTPS)."""
-        await self._emit(f"[INFRA] Checking forwarding rule: {name} (port {port})")
-
-        def _create() -> None:
-            try:
-                self._compute.globalForwardingRules().get(
-                    project=self._project_id, forwardingRule=name,
-                ).execute()
-                logger.info("Forwarding rule %s already exists — skipping.", name)
-                return
-            except api_errors.HttpError as err:
-                if err.resp.status != 404:
-                    raise
-
-            # Retrieve the IP address resource self-link
-            ip_resource = (
-                self._compute.globalAddresses()
-                .get(project=self._project_id, address=ip_name)
-                .execute()
-            )
-            ip_self_link = ip_resource["selfLink"]
-
-            body: dict[str, Any] = {
-                "name": name,
-                "IPAddress": ip_self_link,
-                "IPProtocol": "TCP",
-                "portRange": port,
-                "target": self._self_link(target_proxy_type, target_proxy_name),
-                "loadBalancingScheme": "EXTERNAL",
-            }
-
-            operation = (
-                self._compute.globalForwardingRules()
-                .insert(project=self._project_id, body=body)
-                .execute()
-            )
-            wait_for_global_operation(
-                self._compute, self._project_id, operation["name"],
-            )
-            logger.info("Forwarding rule %s created on port %s.", name, port)
-
-        await self._run_sync(_create)
-        await self._emit(f"[INFRA] Forwarding rule ready: {name} (port {port})")
-
-    # =================================================================
-    #  Step 9 — DNS Zone
+    #  Step 7 — DNS Zone
     # =================================================================
 
     async def _ensure_dns_zone(
         self, safe_domain: str, domain: str, ip_address: str,
-    ) -> None:
-        """Create a Cloud DNS managed zone with A and CNAME records."""
+    ) -> list[str]:
+        """Create a Cloud DNS managed zone with A and CNAME records.
+
+        Returns the list of nameservers assigned to the zone.
+        """
         zone_name = f"{safe_domain}-zone"
         dns_name = f"{domain}."  # DNS names are FQDN with trailing dot
         await self._emit(f"[INFRA] Checking DNS zone: {zone_name}")
@@ -636,7 +575,27 @@ class ProdDeployer:
             )
 
         await self._run_sync(_create)
-        await self._emit(f"[INFRA] DNS zone ready: {zone_name}")
+
+        # Retrieve and display the nameservers so the user can configure
+        # their external registrar (GoDaddy, OVH, etc.)
+        nameservers: list[str] = []
+        try:
+            zone_info = self._dns.managedZones().get(
+                project=self._project_id, managedZone=zone_name,
+            ).execute()
+            nameservers = zone_info.get("nameServers", [])
+            if nameservers:
+                ns_list = ", ".join(nameservers)
+                await self._emit(
+                    f"[INFRA] DNS zone ready: {zone_name} — "
+                    f"Nameservers a configurer chez votre registrar : {ns_list}"
+                )
+            else:
+                await self._emit(f"[INFRA] DNS zone ready: {zone_name}")
+        except Exception:
+            await self._emit(f"[INFRA] DNS zone ready: {zone_name}")
+
+        return nameservers
 
     def _ensure_dns_record(
         self,

@@ -5,9 +5,11 @@ Deployment API routes — create, list, inspect, and stream logs for deployments
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 import uuid
+import zipfile
 from typing import Optional
 
 import aiofiles
@@ -21,8 +23,10 @@ from models.deployment import (
     DeploymentResponse,
     LogEntry,
 )
-from models.enums import DeploymentMode
+from models.enums import DeploymentMode, UserRole
 from services.pipeline_orchestrator import PipelineOrchestrator
+from services.zip_backup import backup_zip
+from api.dependencies import require_approved, require_deploy_permission
 
 logger = logging.getLogger("webdeploy.api.deployments")
 
@@ -38,16 +42,30 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 
 @router.post("/deploy", response_model=DeploymentCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_deployment(
-    zip_file: UploadFile = File(...),
+    zip_file: Optional[UploadFile] = File(None),
+    files: list[UploadFile] = File(default=[]),
     mode: str = Form(...),
     website_name: str = Form(...),
     domain: Optional[str] = Form(None),
     notification_emails: Optional[str] = Form(None),
+    deployer_first_name: str = Form(""),
+    deployer_last_name: str = Form(""),
+    deployer_email: str = Form(""),
+    ai_enabled: str = Form("false"),
+    domain_purchase_confirmed: str = Form("false"),
+    scheduled_at: Optional[str] = Form(None),
+    user=Depends(require_approved),
     db = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> DeploymentCreateResponse:
     """
-    Accept a ZIP upload and kick off the deployment pipeline.
+    Accept a ZIP upload, raw file(s), or a folder and kick off the
+    deployment pipeline.
+
+    Upload types:
+    - ``zip_file``: a single .zip archive (existing behaviour)
+    - ``files``: one or more raw files (single HTML or folder via
+      ``webkitdirectory``).  These are packaged into a ZIP on the fly.
 
     The pipeline runs asynchronously in the background; the response is
     returned immediately with a ``deployment_id`` the client can poll or
@@ -59,6 +77,20 @@ async def create_deployment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid mode '{mode}'. Must be 'demo', 'prod', or 'cloudrun'.",
         )
+
+    # ── Enforce deploy permissions by role ─────────────────────────────
+    require_deploy_permission(mode, user)
+
+    # ── Enforce quotas ─────────────────────────────────────────────────
+    from api.routes.quotas import check_quota
+    check_quota(db, user)
+
+    # ── Auto-fill deployer info from user profile ──────────────────────
+    deployer_email = deployer_email.strip() or getattr(user, "email", "")
+    if not deployer_first_name.strip() and hasattr(user, "display_name") and user.display_name:
+        parts = user.display_name.split(" ", 1)
+        deployer_first_name = parts[0]
+        deployer_last_name = parts[1] if len(parts) > 1 else deployer_last_name
 
     # ── Validate website_name is slug-safe ────────────────────────────
     website_name_lower = website_name.lower().strip()
@@ -79,37 +111,108 @@ async def create_deployment(
             detail="A domain is required for production deployments.",
         )
 
-    # ── Validate ZIP file ─────────────────────────────────────────────
-    if not zip_file.filename or not zip_file.filename.lower().endswith(".zip"):
+    # ── Determine upload type and validate ────────────────────────────
+    has_zip = zip_file is not None and zip_file.filename
+    has_files = len(files) > 0 and any(f.filename for f in files)
+
+    if not has_zip and not has_files:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Uploaded file must be a .zip archive.",
+            detail="No file uploaded. Provide either a zip_file or one or more files.",
         )
 
-    # ── Generate deployment ID and persist the ZIP ────────────────────
+    # ── Generate deployment ID ────────────────────────────────────────
     deployment_id = str(uuid.uuid4())
     zip_dest = settings.upload_path / f"{deployment_id}.zip"
+    stored_zip_filename: str
 
+    if has_zip:
+        # ── ZIP upload — existing flow ────────────────────────────────
+        if not zip_file.filename.lower().endswith(".zip"):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Uploaded file must be a .zip archive.",
+            )
+
+        try:
+            async with aiofiles.open(str(zip_dest), "wb") as f:
+                while chunk := await zip_file.read(1024 * 1024):  # 1 MB chunks
+                    await f.write(chunk)
+        except Exception as exc:
+            logger.exception("Failed to save uploaded ZIP for deployment %s", deployment_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to save uploaded file: {exc}",
+            ) from exc
+
+        stored_zip_filename = zip_file.filename
+        logger.info(
+            "Saved ZIP for deployment %s (%s) -> %s",
+            deployment_id, zip_file.filename, zip_dest,
+        )
+    else:
+        # ── Raw file(s) upload — package into ZIP on the fly ──────────
+        try:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Detect common folder prefix from webkitdirectory uploads
+                # (e.g. "myFolder/index.html", "myFolder/css/style.css")
+                # so we can strip it and keep a clean structure in the ZIP.
+                names = [upload.filename for upload in files if upload.filename]
+                common_prefix = ""
+                if len(names) > 1:
+                    parts_list = [n.replace("\\", "/").split("/") for n in names]
+                    if all(len(p) > 1 for p in parts_list):
+                        first_segment = parts_list[0][0]
+                        if all(p[0] == first_segment for p in parts_list):
+                            common_prefix = first_segment + "/"
+
+                for upload in files:
+                    content = await upload.read()
+                    arcname = upload.filename.replace("\\", "/")
+                    if common_prefix and arcname.startswith(common_prefix):
+                        arcname = arcname[len(common_prefix):]
+                    if not arcname:
+                        continue
+                    zf.writestr(arcname, content)
+            buf.seek(0)
+
+            async with aiofiles.open(str(zip_dest), "wb") as f:
+                await f.write(buf.getvalue())
+        except Exception as exc:
+            logger.exception("Failed to package files for deployment %s", deployment_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to package uploaded files: {exc}",
+            ) from exc
+
+        stored_zip_filename = f"{website_name_lower}-uploaded-files.zip"
+        logger.info(
+            "Packaged %d file(s) into ZIP for deployment %s -> %s",
+            len(files), deployment_id, zip_dest,
+        )
+
+    # ── Backup ZIP to GCS (resilience across container restarts) ─────
     try:
-        async with aiofiles.open(str(zip_dest), "wb") as f:
-            while chunk := await zip_file.read(1024 * 1024):  # 1 MB chunks
-                await f.write(chunk)
-    except Exception as exc:
-        logger.exception("Failed to save uploaded ZIP for deployment %s", deployment_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save uploaded file: {exc}",
-        ) from exc
-
-    logger.info(
-        "Saved ZIP for deployment %s (%s) -> %s",
-        deployment_id, zip_file.filename, zip_dest,
-    )
+        await asyncio.to_thread(backup_zip, settings, deployment_id, zip_dest)
+    except Exception:
+        logger.warning("GCS ZIP backup failed for %s (non-fatal)", deployment_id, exc_info=True)
 
     # ── Parse notification emails ─────────────────────────────────────
     email_list: list[str] = []
     if notification_emails:
         email_list = [e.strip() for e in notification_emails.split(",") if e.strip()]
+    # Auto-include deployer email in notifications
+    deployer_email_stripped = deployer_email.strip()
+    if deployer_email_stripped and deployer_email_stripped not in email_list:
+        email_list.append(deployer_email_stripped)
+
+    # Merge deployer email into the stored notification_emails string
+    all_emails_str = ", ".join(email_list) if email_list else ""
+
+    # ── Parse AI toggle ───────────────────────────────────────────────
+    ai_enabled_bool = ai_enabled.lower() == "true"
+    domain_purchase_confirmed_bool = domain_purchase_confirmed.lower() == "true"
 
     # ── Create DB record ──────────────────────────────────────────────
     crud.create_deployment(
@@ -118,8 +221,12 @@ async def create_deployment(
         website_name=website_name_lower,
         mode=mode,
         domain=domain,
-        notification_emails=notification_emails or "",
-        zip_filename=zip_file.filename,
+        notification_emails=all_emails_str,
+        zip_filename=stored_zip_filename,
+        deployer_first_name=deployer_first_name.strip(),
+        deployer_last_name=deployer_last_name.strip(),
+        deployer_email=deployer_email_stripped,
+        ai_enabled=ai_enabled_bool,
     )
 
     # ── Build pipeline config ─────────────────────────────────────────
@@ -128,7 +235,34 @@ async def create_deployment(
         website_name=website_name_lower,
         domain=domain,
         notification_emails=email_list,
+        deployer_first_name=deployer_first_name.strip(),
+        deployer_last_name=deployer_last_name.strip(),
+        deployer_email=deployer_email_stripped,
+        ai_enabled=ai_enabled_bool,
+        domain_purchase_confirmed=domain_purchase_confirmed_bool,
     )
+
+    # ── Handle scheduled deployment ──────────────────────────────────
+    if scheduled_at:
+        from datetime import datetime as dt
+        try:
+            schedule_time = dt.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            if schedule_time.tzinfo is None:
+                from datetime import timezone as tz
+                schedule_time = schedule_time.replace(tzinfo=tz.utc)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid scheduled_at format: '{scheduled_at}'. Use ISO 8601.",
+            )
+
+        # Update the deployment record with scheduled status
+        db.collection("deployments").document(deployment_id).update({
+            "status": "scheduled",
+            "scheduled_at": schedule_time,
+        })
+        logger.info("Deployment %s scheduled for %s", deployment_id, schedule_time.isoformat())
+        return DeploymentCreateResponse(deployment_id=deployment_id, status="scheduled")
 
     # ── Launch the pipeline in the background ─────────────────────────
     orchestrator = PipelineOrchestrator(settings)
@@ -148,6 +282,7 @@ async def create_deployment(
 @router.delete("/deployments/{deployment_id}", status_code=status.HTTP_200_OK)
 async def delete_deployment(
     deployment_id: str,
+    user=Depends(require_approved),
     db=Depends(get_db),
     settings: Settings = Depends(get_settings),
 ):
@@ -165,6 +300,14 @@ async def delete_deployment(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Deployment '{deployment_id}' not found.",
         )
+
+    # Only owner or admin can delete
+    if user.role != UserRole.ADMIN.value:
+        if getattr(record, "deployer_email", "") != getattr(user, "email", ""):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only delete your own deployments.",
+            )
 
     mode = record.mode
     website_name = record.website_name
@@ -219,10 +362,14 @@ async def delete_deployment(
 def list_deployments(
     limit: int = 100,
     offset: int = 0,
+    user=Depends(require_approved),
     db = Depends(get_db),
 ) -> list[DeploymentResponse]:
-    """Return all deployments, most recent first."""
+    """Return deployments. Admins see all; others see only their own."""
     records = crud.list_deployments(db, limit=limit, offset=offset)
+    if user.role != UserRole.ADMIN.value:
+        user_email = getattr(user, "email", "")
+        records = [r for r in records if getattr(r, "deployer_email", "") == user_email]
     return [DeploymentResponse.from_record(r) for r in records]
 
 

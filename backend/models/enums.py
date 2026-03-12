@@ -24,6 +24,7 @@ class PipelineStep(str, Enum):
     AI_FIX = "AI_FIX"
     BUILD = "BUILD"
     VERIFY = "VERIFY"
+    DOMAIN_REGISTER = "DOMAIN_REGISTER"
     INFRA = "INFRA"
     UPLOAD = "UPLOAD"
     NOTIFY = "NOTIFY"
@@ -41,3 +42,15 @@ class LogLevel(str, Enum):
     INFO = "INFO"
     WARNING = "WARNING"
     ERROR = "ERROR"
+
+
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    SIMPLE_USER = "simple_user"
+    SUPER_USER = "super_user"
+
+
+class UserStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"

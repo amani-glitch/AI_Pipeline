@@ -1,0 +1,23 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: webdeploy-backend-staging
+spec:
+  template:
+    spec:
+      containers:
+        - image: europe-west1-docker.pkg.dev/adp-413110/cloud-run-images/webdeploy-backend:staging
+          env:
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /app/secrets/service-account.json
+          volumeMounts:
+            - name: sa-key
+              mountPath: /app/secrets
+              readOnly: true
+      volumes:
+        - name: sa-key
+          secret:
+            secretName: webdeploy-sa-key
+            items:
+              - key: latest
+                path: service-account.json
