@@ -326,6 +326,15 @@ async def delete_deployment(
             logger.exception("Failed to delete demo resources for %s", deployment_id)
             errors_list.append(f"Demo cleanup error: {exc}")
 
+    elif mode == DeploymentMode.SUBDOMAIN.value:
+        try:
+            from infra.subdomain_deployer import SubdomainDeployer
+            deployer = SubdomainDeployer(config=settings, log_callback=_noop_log)
+            await deployer.delete(website_name=website_name)
+        except Exception as exc:
+            logger.exception("Failed to delete subdomain resources for %s", deployment_id)
+            errors_list.append(f"Subdomain cleanup error: {exc}")
+
     elif mode == DeploymentMode.CLOUDRUN.value:
         try:
             from infra.cloudrun_deployer import CloudRunDeployer

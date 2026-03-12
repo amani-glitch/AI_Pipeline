@@ -7,6 +7,7 @@ from enum import Enum
 
 class DeploymentMode(str, Enum):
     DEMO = "demo"
+    SUBDOMAIN = "subdomain"
     PROD = "prod"
     CLOUDRUN = "cloudrun"
 

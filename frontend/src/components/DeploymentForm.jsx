@@ -336,7 +336,21 @@ export default function DeploymentForm() {
               >
                 Demo
                 <span className="block text-xs font-normal mt-0.5 opacity-80">
-                  Preview on a subdomain
+                  Path-based preview
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("subdomain")}
+                className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all ${
+                  mode === "subdomain"
+                    ? "border-violet-600 bg-violet-600 text-white shadow-md"
+                    : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
+                }`}
+              >
+                Subdomain
+                <span className="block text-xs font-normal mt-0.5 opacity-80">
+                  site.digitaldatatest.com
                 </span>
               </button>
               {!isSimpleUser && (
@@ -396,6 +410,16 @@ export default function DeploymentForm() {
             <p className="mt-1 text-xs text-gray-500">
               Auto-slugified: lowercase, hyphens only.
             </p>
+            {mode === "subdomain" && websiteName.trim() && (
+              <p className="mt-1.5 text-xs text-violet-600 font-medium">
+                URL: https://{websiteName.trim()}.digitaldatatest.com
+              </p>
+            )}
+            {mode === "demo" && websiteName.trim() && (
+              <p className="mt-1.5 text-xs text-blue-600 font-medium">
+                URL: https://digitaldatatest.com/{websiteName.trim()}/
+              </p>
+            )}
           </div>
 
           {/* Domain (prod mode only) */}

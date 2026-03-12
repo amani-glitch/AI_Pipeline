@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     DEMO_DOMAIN: str = "digitaldatatest.com"
     DEMO_URL_MAP_NAME: str = "test-lb"
     DEMO_GLOBAL_IP_NAME: str = "test-lb-ip"
+    DEMO_HTTPS_PROXY_NAME: str = "test-lb-target-proxy"
+    DEMO_WILDCARD_SSL_CERT_NAME: str = "wildcard-digitaldatatest-com"
 
     # Prod infrastructure — shared load balancer (pre-existing)
     PROD_URL_MAP_NAME: str = "websites-urlmap-prod"

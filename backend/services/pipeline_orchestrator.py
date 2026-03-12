@@ -518,6 +518,15 @@ class PipelineOrchestrator:
                 main_html_file=ctx.main_html_file,
             )
 
+        elif ctx.config.mode == DeploymentMode.SUBDOMAIN:
+            from infra.subdomain_deployer import SubdomainDeployer
+
+            deployer = SubdomainDeployer(config=self._settings, log_callback=_async_log)
+            result = await deployer.deploy(
+                website_name=ctx.config.website_name,
+                main_html_file=ctx.main_html_file,
+            )
+
         elif ctx.config.mode == DeploymentMode.CLOUDRUN:
             from infra.cloudrun_deployer import CloudRunDeployer
 
@@ -595,6 +604,9 @@ class PipelineOrchestrator:
             if ctx.config.mode == DeploymentMode.DEMO:
                 url_map_name = self._settings.DEMO_URL_MAP_NAME
                 path = f"/{ctx.config.website_name}/*"
+            elif ctx.config.mode == DeploymentMode.SUBDOMAIN:
+                url_map_name = self._settings.DEMO_URL_MAP_NAME
+                path = "/*"
             else:
                 domain = ctx.config.domain or ctx.config.website_name
                 url_map_name = f"{safe_name(domain)}-url-map"

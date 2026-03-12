@@ -164,16 +164,19 @@ def get_bucket_name(website_name: str, mode: str) -> str:
 
     Args:
         website_name: The logical website name (e.g. ``"my-site"``).
-        mode: ``"demo"`` or ``"prod"``.
+        mode: ``"demo"``, ``"subdomain"``, or ``"prod"``.
 
     Returns:
         A GCP-safe bucket name.
-        - Demo: ``"demo-{safe_name}-bucket-demo"``
-        - Prod: ``"{safe_name}-bucket-prod"``
+        - Demo:      ``"demo-{safe_name}-bucket-demo"``
+        - Subdomain: ``"sub-{safe_name}-bucket-demo"``
+        - Prod:      ``"{safe_name}-bucket-prod"``
     """
     sname = safe_name(website_name)
     if mode == "demo":
         bucket = f"demo-{sname}-bucket-demo"
+    elif mode == "subdomain":
+        bucket = f"sub-{sname}-bucket-demo"
     else:
         bucket = f"{sname}-bucket-prod"
 
@@ -186,16 +189,19 @@ def get_backend_bucket_name(website_name: str, mode: str) -> str:
 
     Args:
         website_name: The logical website name.
-        mode: ``"demo"`` or ``"prod"``.
+        mode: ``"demo"``, ``"subdomain"``, or ``"prod"``.
 
     Returns:
         A GCP-safe backend-bucket name.
-        - Demo: ``"demo-{safe_name}-backend-demo"``
-        - Prod: ``"{safe_name}-backend-prod"``
+        - Demo:      ``"demo-{safe_name}-backend-demo"``
+        - Subdomain: ``"sub-{safe_name}-backend-demo"``
+        - Prod:      ``"{safe_name}-backend-prod"``
     """
     sname = safe_name(website_name)
     if mode == "demo":
         backend = f"demo-{sname}-backend-demo"
+    elif mode == "subdomain":
+        backend = f"sub-{sname}-backend-demo"
     else:
         backend = f"{sname}-backend-prod"
 
