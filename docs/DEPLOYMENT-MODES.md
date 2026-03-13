@@ -86,56 +86,92 @@ dans l'URL correspond au prefix du bucket.
 
 ---
 
-## 2. Mode Subdomain — Host-Based Routing sur Domaine Partage
+## 2. Mode Subdomain — Host-Based Routing sur Sous-domaine
 
 ### Concept
 
-Chaque site obtient un **sous-domaine** du domaine principal :
-`mon-site.digitaldatatest.com`. Le routing se fait par **hostname** (pas par path),
-ce qui donne une URL plus propre et professionnelle.
+Chaque site obtient un **sous-domaine** d'un domaine existant. Le routing se
+fait par **hostname** (pas par path), ce qui donne une URL propre et professionnelle.
 
-### Architecture GCP
+Deux cas sont supportes automatiquement :
+
+### Cas A — Subdomain interne (digitaldatatest.com)
+
+URL: `portfolio.digitaldatatest.com`
+- Utilise le **demo LB** (partage)
+- SSL via **certificat wildcard** `*.digitaldatatest.com`
+- DNS via **record wildcard** → aucune action utilisateur
 
 ```
 Client → https://portfolio.digitaldatatest.com/index.html
          │
          ▼
-   IP Statique Globale (test-lb-ip)  ← Meme IP que demo !
+   IP Statique Globale (test-lb-ip)
          │
          ▼
-   Forwarding Rule (HTTPS:443)
+   Target HTTPS Proxy ←── SSL Wildcard (*.digitaldatatest.com)
          │
-         ▼
-   Target HTTPS Proxy ←── SSL Cert Wildcard (*.digitaldatatest.com)
-         │                 + SSL Cert (digitaldatatest.com)
          ▼
    URL Map (test-lb)
-     │
-     ├─ Host: digitaldatatest.com       ← Demo path-based (existant)
-     │   └─ Path Matcher: main-matcher
-     │       └─ /old-site/* → ...
-     │
-     ├─ Host: portfolio.digitaldatatest.com     ← Subdomain !
-     │   └─ Path Matcher: pm-sub-portfolio
-     │       └─ defaultService → sub-portfolio-backend-demo
-     │                            → gs://sub-portfolio-bucket-demo
-     │
+     ├─ Host: digitaldatatest.com           ← Demo path-based
+     ├─ Host: portfolio.digitaldatatest.com  ← Subdomain interne
+     │   └─ pm-sub-portfolio → sub-portfolio-backend-demo
      └─ Host: ecommerce.digitaldatatest.com
-         └─ Path Matcher: pm-sub-ecommerce
-             └─ defaultService → sub-ecommerce-backend-demo
-                                  → gs://sub-ecommerce-bucket-demo
+         └─ pm-sub-ecommerce → sub-ecommerce-backend-demo
 ```
+
+### Cas B — Subdomain externe (domaine client)
+
+**Exemple reel** : Le client possede `yourlocaleye.com` chez GoDaddy et veut
+deployer `become-a-partner.yourlocaleye.com`
+
+URL: `become-a-partner.yourlocaleye.com`
+- Utilise le **prod LB** (partage)
+- SSL via **certificat individuel** Google-managed pour le FQDN
+- DNS : l'utilisateur doit ajouter un **record A** chez son registrar
+
+```
+Client → https://become-a-partner.yourlocaleye.com
+         │
+         ▼
+   IP Statique Globale (websites-lb-ip-prod)
+         │
+         ▼
+   Target HTTPS Proxy (websites-https-proxy-prod)
+     ├── SSL: become-a-partner-yourlocaleye-com-ssl-cert
+     ├── SSL: (autres certs prod)
+         │
+         ▼
+   URL Map (websites-urlmap-prod)
+     ├─ Host: client-site.com                              ← Prod classique
+     ├─ Host: become-a-partner.yourlocaleye.com            ← Subdomain externe !
+     │   └─ pm-become-a-partner-yourlocaleye-com
+     │       → sub-become-a-partner-backend-demo
+     │         → gs://sub-become-a-partner-bucket-demo
+     └─ Host: share-your-recommendations.yourlocaleye.com
+         └─ pm-share-your-recommendations-yourlocaleye-com
+             → sub-share-your-recommendations-backend-demo
+```
+
+**Action requise apres deploiement** (Cas B uniquement) :
+
+L'utilisateur doit aller chez son registrar et creer :
+```
+become-a-partner.yourlocaleye.com  A  34.8.x.x    (IP du prod LB)
+```
+
+Le certificat SSL se provisionne automatiquement une fois le DNS configure
+(peut prendre jusqu'a 24h).
 
 ### Difference cle avec le mode Demo
 
-| Aspect | Demo (Path) | Subdomain (Host) |
-|--------|-------------|-------------------|
-| URL | `digitaldatatest.com/site/` | `site.digitaldatatest.com` |
-| Routing | Path rules dans 1 matcher | Host rule + path matcher par site |
-| SSL | 1 cert pour le domaine root | 1 cert wildcard `*.domain` |
-| Upload GCS | Fichiers dans `/{site}/` | Fichiers a la racine `/` |
-| Professionnel | Non (path visible) | Oui (URL propre) |
-| DNS | Rien a faire | 1 record DNS wildcard `*.digitaldatatest.com` |
+| Aspect | Demo (Path) | Subdomain Interne | Subdomain Externe |
+|--------|-------------|-------------------|-------------------|
+| URL | `digitaldatatest.com/site/` | `site.digitaldatatest.com` | `site.client.com` |
+| LB utilise | Demo | Demo | Prod |
+| SSL | 1 cert root | Wildcard partage | Cert individuel FQDN |
+| Upload GCS | Dans `/{site}/` | A la racine `/` | A la racine `/` |
+| Action DNS | Aucune | Aucune | Record A chez registrar |
 
 ### Ressources creees par deploiement
 
@@ -143,17 +179,15 @@ Client → https://portfolio.digitaldatatest.com/index.html
 |-----------|---------|------------|
 | GCS Bucket | `sub-{safe_name}-bucket-demo` | Non (1 par site) |
 | Backend Bucket | `sub-{safe_name}-backend-demo` | Non (1 par site) |
-| Host Rule | `{website_name}.digitaldatatest.com` | Ajoutee au URL Map partage |
-| Path Matcher | `pm-sub-{safe_name}` | Non (1 par site) |
-| SSL Wildcard | `wildcard-digitaldatatest-com` | Oui (1 pour tous les subdomains) |
-| IP Globale | `test-lb-ip` | Oui (meme que demo) |
+| Host Rule | `{fqdn}` dans URL Map | Ajoutee (demo ou prod) |
+| Path Matcher | `pm-sub-{safe_name}` ou `pm-{safe_fqdn}` | Non |
+| SSL (interne) | Wildcard existant | Oui |
+| SSL (externe) | `{safe_fqdn}-ssl-cert` | Non |
 
-### Pre-requis (one-time setup)
+### Pre-requis (one-time setup pour Cas A)
 
-1. **Certificat SSL wildcard** : Un certificat Google-managed pour `*.digitaldatatest.com`
-   attache au HTTPS proxy partage
-2. **DNS wildcard** : Un record A `*.digitaldatatest.com` → IP du load balancer
-   (dans Cloud DNS ou chez le registrar)
+1. **Certificat SSL wildcard** : `*.digitaldatatest.com` attache au demo HTTPS proxy
+2. **DNS wildcard** : `*.digitaldatatest.com` A → IP du demo LB
 
 ### Structure des fichiers dans le bucket
 

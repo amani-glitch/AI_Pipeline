@@ -524,6 +524,7 @@ class PipelineOrchestrator:
             deployer = SubdomainDeployer(config=self._settings, log_callback=_async_log)
             result = await deployer.deploy(
                 website_name=ctx.config.website_name,
+                parent_domain=ctx.config.domain,
                 main_html_file=ctx.main_html_file,
             )
 

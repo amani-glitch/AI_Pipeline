@@ -133,6 +133,13 @@ export default function DeploymentForm() {
     domainStatus === "external" ||
     (domainStatus === "available" && domainPurchaseConfirmed);
 
+  // Subdomain mode requires a parent domain (e.g. yourlocaleye.com)
+  // If left empty, defaults to digitaldatatest.com (internal)
+  const subdomainFqdn =
+    mode === "subdomain" && websiteName.trim()
+      ? `${websiteName.trim()}.${domain.trim() || "digitaldatatest.com"}`
+      : "";
+
   const canSubmit =
     uploadData &&
     uploadData.files.length > 0 &&
@@ -215,6 +222,10 @@ export default function DeploymentForm() {
           if (domainPurchaseConfirmed) {
             formData.append("domain_purchase_confirmed", "true");
           }
+        }
+
+        if (mode === "subdomain" && domain.trim()) {
+          formData.append("domain", domain.trim());
         }
 
         if (notificationEmails.trim()) {
@@ -412,7 +423,7 @@ export default function DeploymentForm() {
             </p>
             {mode === "subdomain" && websiteName.trim() && (
               <p className="mt-1.5 text-xs text-violet-600 font-medium">
-                URL: https://{websiteName.trim()}.digitaldatatest.com
+                URL: https://{subdomainFqdn}
               </p>
             )}
             {mode === "demo" && websiteName.trim() && (
@@ -421,6 +432,47 @@ export default function DeploymentForm() {
               </p>
             )}
           </div>
+
+          {/* Parent Domain (subdomain mode) */}
+          {mode === "subdomain" && (
+            <div>
+              <label
+                htmlFor="parent-domain"
+                className="block text-sm font-medium text-gray-700 mb-1"
+              >
+                Domaine parent
+              </label>
+              <input
+                id="parent-domain"
+                type="text"
+                value={domain}
+                onChange={(e) => setDomain(e.target.value)}
+                placeholder="yourlocaleye.com"
+                className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
+                  focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent
+                  placeholder-gray-400"
+              />
+              <p className="mt-1 text-xs text-gray-500">
+                Laissez vide pour utiliser digitaldatatest.com. Pour un domaine externe
+                (GoDaddy, OVH...), vous devrez ajouter un enregistrement DNS A ou CNAME
+                apr&egrave;s le d&eacute;ploiement.
+              </p>
+              {domain.trim() && domain.trim() !== "digitaldatatest.com" && (
+                <div className="mt-2 p-3 bg-violet-50 border border-violet-200 rounded-lg">
+                  <div className="flex items-center gap-2 text-sm text-violet-700">
+                    <Info className="w-4 h-4 flex-shrink-0" />
+                    Domaine externe d&eacute;tect&eacute;
+                  </div>
+                  <p className="mt-1.5 text-xs text-violet-600 ml-6">
+                    Apr&egrave;s le d&eacute;ploiement, ajoutez chez votre registrar :<br />
+                    <code className="bg-violet-100 px-1.5 py-0.5 rounded text-xs font-mono">
+                      {websiteName.trim() || "subdomain"}.{domain.trim()} → A record vers l'IP du load balancer
+                    </code>
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Domain (prod mode only) */}
           {mode === "prod" && (

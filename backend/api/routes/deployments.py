@@ -330,7 +330,8 @@ async def delete_deployment(
         try:
             from infra.subdomain_deployer import SubdomainDeployer
             deployer = SubdomainDeployer(config=settings, log_callback=_noop_log)
-            await deployer.delete(website_name=website_name)
+            parent_domain = getattr(record, "domain", None)
+            await deployer.delete(website_name=website_name, parent_domain=parent_domain)
         except Exception as exc:
             logger.exception("Failed to delete subdomain resources for %s", deployment_id)
             errors_list.append(f"Subdomain cleanup error: {exc}")
