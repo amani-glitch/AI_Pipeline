@@ -64,6 +64,19 @@ export default function DeploymentStatus({ deployment }) {
     deployment.dns_nameservers &&
     deployment.dns_nameservers.length > 0;
 
+  // Subdomain with external domain: show A record instructions
+  const isExternalSubdomain =
+    isSuccess &&
+    deployment.mode === "subdomain" &&
+    deployment.domain &&
+    deployment.domain !== "digitaldatatest.com";
+
+  // Extract subdomain label from URL (e.g. "become-a-partner" from "become-a-partner.yourlocaleye.com")
+  const subdomainLabel = deployment.website_name;
+  const subdomainFqdn = isExternalSubdomain
+    ? `${subdomainLabel}.${deployment.domain}`
+    : null;
+
   return (
     <div className="space-y-4">
       {/* Result banner */}
@@ -339,6 +352,195 @@ export default function DeploymentStatus({ deployment }) {
                   dnschecker.org
                 </a>
                 {" "}et v&eacute;rifiez que les nameservers Google apparaissent bien.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DNS Configuration for external subdomain */}
+      {isExternalSubdomain && (
+        <div className="bg-white rounded-xl border-2 border-violet-200 overflow-hidden">
+          {/* Header */}
+          <div className="bg-violet-50 px-6 py-4 border-b border-violet-200">
+            <div className="flex items-center gap-3">
+              <Server className="w-5 h-5 text-violet-600" />
+              <h3 className="text-lg font-bold text-violet-900">
+                Configuration DNS requise
+              </h3>
+            </div>
+            <p className="mt-1 text-sm text-violet-700">
+              Pour que <strong>{subdomainFqdn}</strong> pointe vers votre site,
+              ajoutez un enregistrement DNS chez votre registrar.
+            </p>
+          </div>
+
+          <div className="p-6 space-y-6">
+            {/* DNS Record to add */}
+            <div>
+              <h4 className="text-sm font-semibold text-gray-800 mb-3">
+                Enregistrement DNS &agrave; ajouter
+              </h4>
+              <div className="border border-gray-200 rounded-lg overflow-hidden">
+                <table className="w-full">
+                  <thead>
+                    <tr className="bg-gray-50 border-b border-gray-200">
+                      <th className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Type
+                      </th>
+                      <th className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Nom / Host
+                      </th>
+                      <th className="px-4 py-2.5 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Valeur / Points to
+                      </th>
+                      <th className="px-4 py-2.5 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                        Copier
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="bg-white">
+                      <td className="px-4 py-3 text-sm font-mono font-bold text-violet-700">
+                        A
+                      </td>
+                      <td className="px-4 py-3 text-sm font-mono font-medium text-gray-900">
+                        {subdomainLabel}
+                      </td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-700">
+                        <span className="text-xs text-gray-500">(IP affich&eacute;e dans les logs du d&eacute;ploiement)</span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => handleCopyNs(subdomainLabel, "sub-name")}
+                          className="inline-flex items-center gap-1 text-xs text-gray-400
+                            hover:text-violet-600 transition-colors"
+                          title={`Copier ${subdomainLabel}`}
+                        >
+                          {copiedNs === "sub-name" ? (
+                            <Check className="w-4 h-4 text-green-500" />
+                          ) : (
+                            <Copy className="w-4 h-4" />
+                          )}
+                        </button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Step-by-step instructions */}
+            <div>
+              <h4 className="text-sm font-semibold text-gray-800 mb-3">
+                &Eacute;tapes &agrave; suivre
+              </h4>
+              <ol className="space-y-3">
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-100 text-violet-700
+                    text-sm font-bold flex items-center justify-center">
+                    1
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Connectez-vous &agrave; votre registrar
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Allez sur le site o&ugrave; le domaine <strong>{deployment.domain}</strong> est
+                      enregistr&eacute; (GoDaddy, OVH, Namecheap, Cloudflare, etc.)
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-100 text-violet-700
+                    text-sm font-bold flex items-center justify-center">
+                    2
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Acc&eacute;dez aux param&egrave;tres DNS
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Allez dans <strong>DNS Management</strong> ou <strong>Zone DNS</strong> pour
+                      le domaine <strong>{deployment.domain}</strong>.
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-100 text-violet-700
+                    text-sm font-bold flex items-center justify-center">
+                    3
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Ajoutez un enregistrement A
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Cliquez sur <strong>Add Record</strong> et configurez :<br />
+                      &bull; Type : <strong>A</strong><br />
+                      &bull; Nom / Host : <strong>{subdomainLabel}</strong><br />
+                      &bull; Valeur : l'adresse IP affich&eacute;e dans les logs ci-dessous<br />
+                      &bull; TTL : 3600 (ou &laquo; Auto &raquo;)
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-violet-100 text-violet-700
+                    text-sm font-bold flex items-center justify-center">
+                    4
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      Sauvegardez et patientez
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      La propagation DNS prend entre <strong>5 minutes et 1 heure</strong>.
+                      Le certificat SSL sera automatiquement provisionn&eacute; par Google
+                      une fois le DNS actif (jusqu'&agrave; 24h).
+                    </p>
+                  </div>
+                </li>
+                <li className="flex gap-3">
+                  <span className="flex-shrink-0 w-7 h-7 rounded-full bg-green-100 text-green-700
+                    text-sm font-bold flex items-center justify-center">
+                    5
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-gray-800">
+                      V&eacute;rifiez que tout fonctionne
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Testez en ouvrant{" "}
+                      <a
+                        href={deployment.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-violet-600 hover:underline"
+                      >
+                        {deployment.url}
+                      </a>
+                    </p>
+                  </div>
+                </li>
+              </ol>
+            </div>
+
+            {/* Quick tip */}
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg">
+              <p className="text-xs text-amber-800">
+                <strong>Important :</strong> Ne changez PAS les nameservers du
+                domaine <strong>{deployment.domain}</strong>. Il suffit d'ajouter
+                un <strong>enregistrement A</strong> pour le sous-domaine
+                {" "}<strong>{subdomainLabel}</strong>.
+                V&eacute;rifiez avec{" "}
+                <a
+                  href={`https://dnschecker.org/#A/${subdomainFqdn}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-amber-700 underline hover:text-amber-900"
+                >
+                  dnschecker.org
+                </a>
               </p>
             </div>
           </div>
