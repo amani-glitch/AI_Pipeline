@@ -86,6 +86,31 @@ class ProdDeployer:
 
     # ─── helpers ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_subdomain(domain: str) -> bool:
+        """Return True if *domain* is a subdomain (e.g. blog.example.com).
+
+        Simple heuristic: a domain with 3+ dot-separated parts is treated
+        as a subdomain.  This works for standard TLDs (.com, .fr, .org).
+        For two-part TLDs (.co.uk, .com.au) the caller should pass the
+        full root domain as-is — in practice our users deploy on standard
+        TLDs so this is fine.
+        """
+        parts = domain.strip(".").split(".")
+        return len(parts) > 2
+
+    @staticmethod
+    def _get_parent_domain(domain: str) -> str:
+        """Extract the parent domain from a subdomain.
+
+        ``blog.example.com`` → ``example.com``
+        ``example.com``      → ``example.com``  (identity)
+        """
+        parts = domain.strip(".").split(".")
+        if len(parts) > 2:
+            return ".".join(parts[-2:])
+        return domain
+
     async def _emit(self, message: str) -> None:
         """Send a progress message through the log callback."""
         try:
@@ -110,16 +135,21 @@ class ProdDeployer:
     async def deploy(self, website_name: str, domain: str, main_html_file: str = "index.html") -> DeploymentResult:
         """Provision production infrastructure for *domain* using the shared LB.
 
+        Supports both root domains (``example.com``) and subdomains
+        (``blog.example.com``).  For subdomains the existing parent DNS zone
+        is reused and no ``www`` variant is created.
+
         Returns a ``DeploymentResult`` with the public URL on success,
         or an error description on failure.
         """
         safe_domain = safe_name(domain)
         bucket_name = get_bucket_name(domain, "prod")
         backend_bucket_name = get_backend_bucket_name(domain, "prod")
+        is_subdomain = self._is_subdomain(domain)
 
         await self._emit(
             f"[INFRA] Starting production deployment for '{website_name}' "
-            f"on domain '{domain}' (safe: {safe_domain})"
+            f"on {'subdomain' if is_subdomain else 'domain'} '{domain}' (safe: {safe_domain})"
         )
 
         try:
@@ -133,23 +163,33 @@ class ProdDeployer:
             await self._ensure_backend_bucket(backend_bucket_name, bucket_name)
 
             # Step 4 — Add host rule to shared URL map
+            # Subdomains only get the exact subdomain; root domains also get www
             await self._add_host_rule_to_shared_url_map(
                 domain, safe_domain, backend_bucket_name,
+                include_www=not is_subdomain,
             )
 
             # Step 5 — SSL certificate
             ssl_cert_name: str | None = None
             if self._config.PROD_AUTO_CREATE_SSL_CERT:
                 ssl_cert_name = f"{safe_domain}-ssl-cert"
-                await self._ensure_ssl_certificate(ssl_cert_name, domain)
+                await self._ensure_ssl_certificate(
+                    ssl_cert_name, domain,
+                    include_www=not is_subdomain,
+                )
 
                 # Step 6 — Attach SSL cert to shared HTTPS proxy
                 await self._add_ssl_cert_to_shared_proxy(ssl_cert_name)
 
-            # Step 7 — DNS zone (optional)
+            # Step 7 — DNS (optional)
             dns_nameservers: list[str] = []
             if self._config.PROD_AUTO_CREATE_DNS_ZONE:
-                dns_nameservers = await self._ensure_dns_zone(safe_domain, domain, ip_address)
+                if is_subdomain:
+                    # Subdomain: find the parent zone and add an A record there
+                    await self._ensure_subdomain_record(domain, ip_address)
+                else:
+                    # Root domain: create a new zone with A + CNAME
+                    dns_nameservers = await self._ensure_dns_zone(safe_domain, domain, ip_address)
 
             url = f"https://{domain}/"
             await self._emit(f"[INFRA] Production deployment complete: {url}")
@@ -221,7 +261,7 @@ class ProdDeployer:
             bucket.versioning_enabled = False
             bucket.cors = [
                 {
-                    "origin": [f"https://{domain}"],
+                    "origin": [f"https://{domain}", f"https://www.{domain}"],
                     "method": ["GET", "HEAD", "OPTIONS"],
                     "responseHeader": [
                         "Content-Type",
@@ -316,12 +356,17 @@ class ProdDeployer:
 
     async def _add_host_rule_to_shared_url_map(
         self, domain: str, safe_domain: str, backend_bucket_name: str,
+        *, include_www: bool = True,
     ) -> None:
         """Add a host rule for *domain* to the shared prod URL map.
 
         Each domain gets its own hostRule + pathMatcher pointing to its
         backend bucket.  Existing rules for other domains are preserved.
         If the domain is already present, this is a no-op.
+
+        Args:
+            include_www: When ``True`` (root domains), also route
+                ``www.<domain>``.  ``False`` for subdomains.
         """
         url_map_name = self._config.PROD_URL_MAP_NAME
         await self._emit(
@@ -334,7 +379,10 @@ class ProdDeployer:
 
             for attempt in range(1, max_retries + 1):
                 try:
-                    self._patch_shared_url_map(url_map_name, domain, safe_domain, backend_bucket_name)
+                    self._patch_shared_url_map(
+                        url_map_name, domain, safe_domain,
+                        backend_bucket_name, include_www=include_www,
+                    )
                     return
                 except api_errors.HttpError as err:
                     if err.resp.status == 400 and "resourceNotReady" in str(err):
@@ -352,7 +400,8 @@ class ProdDeployer:
         await self._emit(f"[INFRA] Host rule added for '{domain}' in shared URL map")
 
     def _patch_shared_url_map(
-        self, url_map_name: str, domain: str, safe_domain: str, backend_bucket_name: str,
+        self, url_map_name: str, domain: str, safe_domain: str,
+        backend_bucket_name: str, *, include_www: bool = True,
     ) -> None:
         """Fetch the shared URL map, add a host rule for the domain, and patch."""
         url_map = (
@@ -363,13 +412,41 @@ class ProdDeployer:
 
         # Check if the domain already has a host rule
         host_rules: list[dict] = url_map.get("hostRules", [])
+        needs_www_update = False
         for hr in host_rules:
-            if domain in hr.get("hosts", []):
-                logger.info(
-                    "Host rule for '%s' already exists in URL map '%s' — skipping.",
-                    domain, url_map_name,
+            hosts = hr.get("hosts", [])
+            if domain in hosts:
+                # For root domains, ensure www variant is also present
+                if include_www and f"www.{domain}" not in hosts:
+                    hosts.append(f"www.{domain}")
+                    needs_www_update = True
+                    logger.info(
+                        "Added 'www.%s' to existing host rule in URL map '%s'.",
+                        domain, url_map_name,
+                    )
+                else:
+                    logger.info(
+                        "Host rule for '%s' already exists in URL map '%s' — skipping.",
+                        domain, url_map_name,
+                    )
+                    return
+
+        if needs_www_update:
+            # Only patch URL map to add www, don't create new path matcher
+            url_map["hostRules"] = host_rules
+            operation = (
+                self._compute.urlMaps()
+                .patch(
+                    project=self._project_id,
+                    urlMap=url_map_name,
+                    body=url_map,
                 )
-                return
+                .execute()
+            )
+            wait_for_global_operation(
+                self._compute, self._project_id, operation["name"],
+            )
+            return
 
         # Resolve the backend bucket self-link
         bb_resource = (
@@ -391,8 +468,11 @@ class ProdDeployer:
         url_map["pathMatchers"] = path_matchers
 
         # Add the new host rule
+        hosts_list = [domain]
+        if include_www:
+            hosts_list.append(f"www.{domain}")
         host_rules.append({
-            "hosts": [domain],
+            "hosts": hosts_list,
             "pathMatcher": matcher_name,
         })
         url_map["hostRules"] = host_rules
@@ -421,8 +501,14 @@ class ProdDeployer:
 
     async def _ensure_ssl_certificate(
         self, ssl_cert_name: str, domain: str,
+        *, include_www: bool = True,
     ) -> None:
-        """Create a Google-managed SSL certificate for the domain."""
+        """Create a Google-managed SSL certificate for the domain.
+
+        Args:
+            include_www: When ``True`` (root domains), the cert also covers
+                ``www.<domain>``.  ``False`` for subdomains.
+        """
         await self._emit(f"[INFRA] Checking SSL certificate: {ssl_cert_name}")
 
         def _create() -> None:
@@ -436,11 +522,15 @@ class ProdDeployer:
                 if err.resp.status != 404:
                     raise
 
+            cert_domains = [domain]
+            if include_www:
+                cert_domains.append(f"www.{domain}")
+
             body: dict[str, Any] = {
                 "name": ssl_cert_name,
                 "type": "MANAGED",
                 "managed": {
-                    "domains": [domain],
+                    "domains": cert_domains,
                 },
             }
 
@@ -596,6 +686,87 @@ class ProdDeployer:
             await self._emit(f"[INFRA] DNS zone ready: {zone_name}")
 
         return nameservers
+
+    # =================================================================
+    #  Step 7b — Subdomain DNS Record (reuse existing parent zone)
+    # =================================================================
+
+    def _find_parent_zone(self, parent_domain: str) -> str | None:
+        """Find the Cloud DNS managed zone for *parent_domain*.
+
+        Scans all zones in the project and matches by ``dnsName``.
+        Returns the zone name (e.g. ``"bestoftours-com-zone"``) or ``None``.
+        """
+        target_dns_name = f"{parent_domain}."
+        try:
+            response = self._dns.managedZones().list(
+                project=self._project_id,
+            ).execute()
+            for zone in response.get("managedZones", []):
+                if zone.get("dnsName") == target_dns_name:
+                    return zone["name"]
+        except Exception as exc:
+            logger.warning(
+                "Failed to list DNS zones when looking for parent %s: %s",
+                parent_domain, exc,
+            )
+        return None
+
+    async def _ensure_subdomain_record(
+        self, domain: str, ip_address: str,
+    ) -> None:
+        """Add an A record for a subdomain to its parent's existing DNS zone.
+
+        For example, if *domain* is ``blog.bestoftours.com``, this finds the
+        managed zone for ``bestoftours.com`` and adds an A record for
+        ``blog.bestoftours.com.`` pointing to *ip_address*.
+
+        If no parent zone is found, falls back to creating a new standalone
+        zone for the full subdomain (same as root domain behavior).
+        """
+        parent_domain = self._get_parent_domain(domain)
+        subdomain_dns_name = f"{domain}."
+
+        await self._emit(
+            f"[INFRA] Subdomain '{domain}' — looking for existing DNS zone "
+            f"for parent '{parent_domain}'"
+        )
+
+        def _create() -> str | None:
+            parent_zone = self._find_parent_zone(parent_domain)
+            if parent_zone is None:
+                return None  # signal fallback
+
+            logger.info(
+                "Found parent DNS zone '%s' for %s — adding A record for %s",
+                parent_zone, parent_domain, domain,
+            )
+
+            # Add A record for the subdomain
+            self._ensure_dns_record(
+                zone_name=parent_zone,
+                record_name=subdomain_dns_name,
+                record_type="A",
+                ttl=300,
+                rrdatas=[ip_address],
+            )
+            return parent_zone
+
+        result = await self._run_sync(_create)
+
+        if result is not None:
+            await self._emit(
+                f"[INFRA] DNS record added: {domain} -> {ip_address} "
+                f"(in existing zone '{result}')"
+            )
+        else:
+            # No parent zone found — fall back to creating a standalone zone
+            await self._emit(
+                f"[INFRA] No existing DNS zone found for '{parent_domain}' — "
+                f"creating standalone zone for '{domain}'"
+            )
+            safe_domain = safe_name(domain)
+            await self._ensure_dns_zone(safe_domain, domain, ip_address)
 
     def _ensure_dns_record(
         self,

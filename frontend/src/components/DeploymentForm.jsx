@@ -133,13 +133,6 @@ export default function DeploymentForm() {
     domainStatus === "external" ||
     (domainStatus === "available" && domainPurchaseConfirmed);
 
-  // Subdomain mode requires a parent domain (e.g. yourlocaleye.com)
-  // If left empty, defaults to digitaldatatest.com (internal)
-  const subdomainFqdn =
-    mode === "subdomain" && websiteName.trim()
-      ? `${websiteName.trim()}.${domain.trim() || "digitaldatatest.com"}`
-      : "";
-
   const canSubmit =
     uploadData &&
     uploadData.files.length > 0 &&
@@ -222,10 +215,6 @@ export default function DeploymentForm() {
           if (domainPurchaseConfirmed) {
             formData.append("domain_purchase_confirmed", "true");
           }
-        }
-
-        if (mode === "subdomain" && domain.trim()) {
-          formData.append("domain", domain.trim());
         }
 
         if (notificationEmails.trim()) {
@@ -348,20 +337,6 @@ export default function DeploymentForm() {
                 Demo
                 <span className="block text-xs font-normal mt-0.5 opacity-80">
                   Path-based preview
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode("subdomain")}
-                className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all ${
-                  mode === "subdomain"
-                    ? "border-violet-600 bg-violet-600 text-white shadow-md"
-                    : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
-                }`}
-              >
-                Subdomain
-                <span className="block text-xs font-normal mt-0.5 opacity-80">
-                  site.digitaldatatest.com
                 </span>
               </button>
               {!isSimpleUser && (
@@ -488,12 +463,15 @@ export default function DeploymentForm() {
                 type="text"
                 value={domain}
                 onChange={(e) => setDomain(e.target.value)}
-                placeholder="client-site.com"
+                placeholder="client-site.com ou blog.client-site.com"
                 className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
                   focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:border-transparent
                   placeholder-gray-400"
                 required
               />
+              <p className="mt-1 text-xs text-gray-500">
+                Domaine racine (example.com) ou sous-domaine (blog.example.com).
+              </p>
 
               {/* Domain status indicator */}
               {domainStatus === "checking" && (

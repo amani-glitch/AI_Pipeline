@@ -78,18 +78,33 @@ class DomainService:
             logger.warning("Error checking Cloud Domains for %s: %s", domain, exc)
             return None
 
+    @staticmethod
+    def _is_subdomain(domain: str) -> bool:
+        """Return True if *domain* has 3+ dot-separated parts (e.g. blog.example.com)."""
+        return len(domain.strip(".").split(".")) > 2
+
+    @staticmethod
+    def _get_parent_domain(domain: str) -> str:
+        """Extract parent domain: ``blog.example.com`` -> ``example.com``."""
+        parts = domain.strip(".").split(".")
+        return ".".join(parts[-2:]) if len(parts) > 2 else domain
+
     def _check_cloud_dns(self, domain: str) -> Optional[DomainCheckResult]:
-        """Check if a Cloud DNS managed zone exists for this domain."""
+        """Check if a Cloud DNS managed zone exists for this domain or its parent.
+
+        For subdomains (e.g. ``blog.example.com``), also checks if the parent
+        domain (``example.com``) has a DNS zone — if so, the subdomain is
+        considered "owned" because we can add records to it.
+        """
         try:
             dns = self._get_dns_service()
-            # DNS zone names use the domain with dots replaced by hyphens
-            # But we can't guess the zone name, so list all and match by dnsName
             response = dns.managedZones().list(project=self._project).execute()
             zones = response.get("managedZones", [])
 
             # Cloud DNS stores dnsName with trailing dot: "example.com."
             target_dns_name = f"{domain}."
 
+            # 1. Exact match — zone exists for this domain
             for zone in zones:
                 if zone.get("dnsName") == target_dns_name:
                     logger.info(
@@ -100,6 +115,26 @@ class DomainService:
                         status="owned",
                         message=f"Domaine {domain} configuré dans Cloud DNS (zone: {zone.get('name')}).",
                     )
+
+            # 2. Subdomain check — look for parent zone
+            if self._is_subdomain(domain):
+                parent = self._get_parent_domain(domain)
+                parent_dns_name = f"{parent}."
+                for zone in zones:
+                    if zone.get("dnsName") == parent_dns_name:
+                        logger.info(
+                            "Subdomain %s — parent zone '%s' found for %s",
+                            domain, zone.get("name"), parent,
+                        )
+                        return DomainCheckResult(
+                            status="owned",
+                            message=(
+                                f"Sous-domaine {domain} — la zone DNS du domaine parent "
+                                f"{parent} existe (zone: {zone.get('name')}). "
+                                f"Un enregistrement A sera ajouté automatiquement."
+                            ),
+                        )
+
             return None
         except Exception as exc:
             logger.warning("Error checking Cloud DNS for %s: %s", domain, exc)
@@ -110,24 +145,55 @@ class DomainService:
         Check whether a domain is already managed in this GCP project,
         available for purchase, or unavailable.
 
+        For subdomains (e.g. ``blog.example.com``), checks whether the
+        parent domain's DNS zone exists.  Cloud Domains availability
+        search is only performed for root domains.
+
         Checks in order:
         1. Cloud Domains registrations (bought via Google)
-        2. Cloud DNS zones (domain managed here, possibly bought elsewhere)
-        3. Cloud Domains availability search (can we buy it?)
+        2. Cloud DNS zones (domain or parent domain managed here)
+        3. Cloud Domains availability search (root domains only)
         """
-        # 1. Cloud Domains registration
-        result = self._check_cloud_domains(domain)
+        is_subdomain = self._is_subdomain(domain)
+        parent_domain = self._get_parent_domain(domain) if is_subdomain else domain
+
+        # 1. Cloud Domains registration (check parent for subdomains)
+        result = self._check_cloud_domains(parent_domain)
         if result:
+            if is_subdomain:
+                return DomainCheckResult(
+                    status="owned",
+                    message=(
+                        f"Sous-domaine {domain} — le domaine parent {parent_domain} "
+                        f"est enregistré via Google Cloud Domains. "
+                        f"Un enregistrement A sera ajouté automatiquement."
+                    ),
+                )
             return result
 
-        # 2. Cloud DNS zone
+        # 2. Cloud DNS zone (also checks parent for subdomains)
         result = self._check_cloud_dns(domain)
         if result:
             return result
 
+        # 3. For subdomains without a parent zone, explain what's needed
+        if is_subdomain:
+            logger.info(
+                "Subdomain %s — no parent zone found for %s",
+                domain, parent_domain,
+            )
+            return DomainCheckResult(
+                status="external",
+                message=(
+                    f"Sous-domaine {domain} — aucune zone DNS trouvée pour {parent_domain}. "
+                    f"Une nouvelle zone DNS sera créée automatiquement. "
+                    f"Vous devrez configurer les nameservers chez votre registrar."
+                ),
+            )
+
         logger.info("Domain %s not found in project — checking availability", domain)
 
-        # 3. Check availability via searchDomains
+        # 4. Check availability via searchDomains (root domains only)
         try:
             client = self._get_domains_client()
             response = client.search_domains(
@@ -152,9 +218,6 @@ class DomainService:
                             message=f"Domaine {domain} disponible — {amount:.2f} {currency}/an",
                         )
                     else:
-                        # Domain is registered somewhere else (GoDaddy, OVH, etc.)
-                        # This is NOT an error — the user can still deploy and
-                        # configure nameservers afterwards.
                         logger.info("Domain %s registered externally (not in GCP)", domain)
                         return DomainCheckResult(
                             status="external",
@@ -164,7 +227,6 @@ class DomainService:
                             ),
                         )
 
-            # Domain not in search results — treat as external too
             return DomainCheckResult(
                 status="external",
                 message=(
@@ -187,7 +249,7 @@ class DomainService:
         Purchase/register a domain via Cloud Domains API.
         Uses WHOIS contact info from settings.
         """
-        client = self._get_client()
+        client = self._get_domains_client()
         settings = self._settings
 
         # Build contact info from settings

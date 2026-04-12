@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     PROD_GLOBAL_IP_NAME: str = "websites-lb-ip-prod"
     PROD_HTTPS_PROXY_NAME: str = "websites-https-proxy-prod"
 
+    # Prod infrastructure — shared load balancer (pre-existing)
+    PROD_URL_MAP_NAME: str = "websites-urlmap-prod"
+    PROD_GLOBAL_IP_NAME: str = "websites-lb-ip-prod"
+    PROD_HTTPS_PROXY_NAME: str = "websites-https-proxy-prod"
+
     # Prod infrastructure toggles
     PROD_AUTO_REGISTER_DOMAINS: bool = False
     PROD_AUTO_CREATE_DNS_ZONE: bool = True
