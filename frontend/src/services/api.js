@@ -148,14 +148,16 @@ export async function listUsers() {
 }
 
 /**
- * Approve a user (admin or email token).
+ * Approve a user (admin or email token). Optionally override the requested role.
  * @param {string} uid - Firebase UID.
- * @param {string} [token] - Optional approval token from email link.
+ * @param {{role?: string, token?: string}} [options]
  * @returns {Promise<object>} Updated user profile.
  */
-export async function approveUser(uid, token) {
+export async function approveUser(uid, options = {}) {
+  const { role, token } = options;
   const params = token ? { token } : {};
-  const response = await api.post(`/api/auth/approve/${uid}`, null, { params });
+  const body = role ? { role } : null;
+  const response = await api.post(`/api/auth/approve/${uid}`, body, { params });
   return response.data;
 }
 
@@ -168,6 +170,33 @@ export async function approveUser(uid, token) {
 export async function rejectUser(uid, token) {
   const params = token ? { token } : {};
   const response = await api.post(`/api/auth/reject/${uid}`, null, { params });
+  return response.data;
+}
+
+/**
+ * Change the role of an approved user (admin only).
+ * @param {string} uid
+ * @param {string} role - "admin" | "super_user" | "simple_user"
+ */
+export async function updateUserRole(uid, role) {
+  const response = await api.patch(`/api/auth/users/${uid}/role`, { role });
+  return response.data;
+}
+
+/**
+ * Admin creates a user directly (approved, with role).
+ * @param {{email: string, display_name?: string, role: string}} payload
+ */
+export async function adminCreateUser(payload) {
+  const response = await api.post("/api/auth/users", payload);
+  return response.data;
+}
+
+/**
+ * Admin deletes a user (Firestore + Firebase Auth).
+ */
+export async function adminDeleteUser(uid) {
+  const response = await api.delete(`/api/auth/users/${uid}`);
   return response.data;
 }
 

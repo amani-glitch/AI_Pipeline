@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from config import Settings, get_settings
 from db.database import get_db
@@ -26,6 +26,21 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 class GoogleSignInRequest(BaseModel):
     credential: str  # Google ID token from Google Identity Services
+
+
+class ApproveUserRequest(BaseModel):
+    """Optional body for approve endpoint — admin may override requested role."""
+    role: Optional[UserRole] = None
+
+
+class UpdateRoleRequest(BaseModel):
+    role: UserRole
+
+
+class AdminCreateUserRequest(BaseModel):
+    email: EmailStr
+    display_name: str = ""
+    role: UserRole = UserRole.SIMPLE_USER
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -179,20 +194,32 @@ def get_me(user=Depends(get_current_user)):
 @router.post("/approve/{uid}", response_model=UserResponse)
 async def approve_user(
     uid: str,
+    body: Optional[ApproveUserRequest] = Body(None),
     token: Optional[str] = Query(None),
+    role: Optional[UserRole] = Query(None),
     credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
     db=Depends(get_db),
     settings: Settings = Depends(get_settings),
 ):
-    """Approve a pending user. Auth via admin session OR email token."""
+    """Approve a pending user. Auth via admin session OR email token.
+
+    The admin may override the requested role by passing ``role`` in the JSON
+    body (session auth) or as a query parameter (email-link flow).
+    """
     _authorize_action(uid, "approve", token, credentials, db)
 
     target = crud.get_user(db, uid)
     if target is None:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    role = target.requested_role or UserRole.SIMPLE_USER.value
-    crud.update_user_status(db, uid, status=UserStatus.APPROVED.value, role=role, approved_by="admin")
+    # Role resolution priority: explicit body > query param > requested > default
+    override_role = (body.role if body and body.role else None) or role
+    if override_role is not None:
+        final_role = override_role.value
+    else:
+        final_role = target.requested_role or UserRole.SIMPLE_USER.value
+    crud.update_user_status(db, uid, status=UserStatus.APPROVED.value, role=final_role, approved_by="admin")
+    role_for_email = final_role
 
     # Notify the user (if they haven't disabled account notifications)
     try:
@@ -204,7 +231,7 @@ async def approve_user(
                 to_email=target.email,
                 display_name=getattr(target, "display_name", ""),
                 user_status=UserStatus.APPROVED.value,
-                role=role,
+                role=role_for_email,
             )
     except Exception:
         logger.exception("Failed to send approval notification to %s", target.email)
@@ -299,6 +326,137 @@ def list_users(user=Depends(require_admin), db=Depends(get_db)):
     """Return all registered users (admin only)."""
     records = crud.list_users(db)
     return [UserResponse.from_record(r) for r in records]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PATCH /api/auth/users/{uid}/role — change role of an approved user
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.patch("/users/{uid}/role", response_model=UserResponse)
+def update_user_role(
+    uid: str,
+    body: UpdateRoleRequest,
+    admin=Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Change a user's effective role (admin only)."""
+    target = crud.get_user(db, uid)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if target.status != UserStatus.APPROVED.value:
+        raise HTTPException(
+            status_code=400,
+            detail="Le rôle ne peut être changé que pour un utilisateur approuvé.",
+        )
+    crud.update_user_role(db, uid, body.role.value)
+    updated = crud.get_user(db, uid)
+    return UserResponse.from_record(updated)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  POST /api/auth/users — admin creates a user
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def admin_create_user(
+    body: AdminCreateUserRequest,
+    admin=Depends(require_admin),
+    db=Depends(get_db),
+    settings: Settings = Depends(get_settings),
+):
+    """Create a user directly (admin action).
+
+    The user is created in Firebase Auth (if not already present) and marked
+    approved in Firestore with the given role. On next Google sign-in they
+    will land with the role already assigned.
+    """
+    from firebase_admin import auth as fb_auth
+
+    email = body.email.lower().strip()
+    display_name = body.display_name.strip()
+
+    # Get or create the Firebase Auth user
+    try:
+        fb_user = fb_auth.get_user_by_email(email)
+        uid = fb_user.uid
+        if display_name and fb_user.display_name != display_name:
+            try:
+                fb_auth.update_user(uid, display_name=display_name)
+            except Exception:
+                logger.warning("Failed to update Firebase display_name for %s", uid)
+    except fb_auth.UserNotFoundError:
+        fb_user = fb_auth.create_user(
+            email=email,
+            display_name=display_name,
+            email_verified=False,
+        )
+        uid = fb_user.uid
+
+    # Reject if already in Firestore
+    existing = crud.get_user(db, uid)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Un utilisateur avec l'email {email} existe déjà.",
+        )
+
+    user = crud.create_user_approved(
+        db,
+        uid=uid,
+        email=email,
+        display_name=display_name or email,
+        role=body.role.value,
+        approved_by=getattr(admin, "email", "admin"),
+    )
+
+    # Best-effort status email to let the user know their account is ready
+    try:
+        from services.email_service import EmailService
+        email_svc = EmailService(settings=settings)
+        await email_svc.send_status_notification(
+            to_email=email,
+            display_name=display_name or email,
+            user_status=UserStatus.APPROVED.value,
+            role=body.role.value,
+        )
+    except Exception:
+        logger.exception("Failed to send invitation email to %s", email)
+
+    return UserResponse.from_record(user)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DELETE /api/auth/users/{uid} — admin deletes a user
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.delete("/users/{uid}", status_code=status.HTTP_200_OK)
+def admin_delete_user(
+    uid: str,
+    admin=Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Delete a user from Firestore and (best-effort) from Firebase Auth."""
+    if uid == getattr(admin, "uid", None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vous ne pouvez pas supprimer votre propre compte.",
+        )
+
+    target = crud.get_user(db, uid)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # Firestore
+    crud.delete_user(db, uid)
+
+    # Firebase Auth (best-effort)
+    try:
+        from firebase_admin import auth as fb_auth
+        fb_auth.delete_user(uid)
+    except Exception:
+        logger.warning("Failed to delete Firebase Auth user %s (non-fatal)", uid, exc_info=True)
+
+    return {"deleted": True, "uid": uid}
 
 
 # ── Private helper ────────────────────────────────────────────────────

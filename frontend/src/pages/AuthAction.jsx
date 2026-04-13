@@ -22,7 +22,7 @@ export default function AuthAction() {
     const performAction = async () => {
       try {
         if (action === "approve") {
-          await approveUser(uid, token);
+          await approveUser(uid, { token });
           setMessage("L'utilisateur a été approuvé avec succès.");
         } else if (action === "reject") {
           await rejectUser(uid, token);

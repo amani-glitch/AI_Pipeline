@@ -22,9 +22,11 @@ export default function DeploymentForm() {
   const [gitContext, setGitContext] = useState(null); // { event, connection }
 
   const [uploadData, setUploadData] = useState(null); // { type, files } | null
-  const [mode, setMode] = useState("demo");
+  const [mode, setMode] = useState("demo"); // UI mode: "demo" | "prod" | "subdomain" | "cloudrun"
   const [websiteName, setWebsiteName] = useState("");
   const [domain, setDomain] = useState("");
+  const [parentDomain, setParentDomain] = useState("");
+  const [subdomainLabel, setSubdomainLabel] = useState("");
   const [deployerFirstName, setDeployerFirstName] = useState("");
   const [deployerLastName, setDeployerLastName] = useState("");
   const [deployerEmail, setDeployerEmail] = useState("");
@@ -116,7 +118,17 @@ export default function DeploymentForm() {
     }
   }, [deployerEmail]);
 
-  // Debounced domain check when domain changes in prod mode
+  // Compose the full FQDN in subdomain mode
+  const composedSubdomainFqdn =
+    mode === "subdomain" && subdomainLabel.trim() && parentDomain.trim()
+      ? `${subdomainLabel.trim()}.${parentDomain.trim()}`
+      : "";
+
+  // The domain to validate depends on the mode
+  const effectiveDomain =
+    mode === "subdomain" ? composedSubdomainFqdn : domain.trim();
+
+  // Debounced domain check when domain changes in prod or subdomain mode
   useEffect(() => {
     // Reset on mode/domain change
     setDomainStatus(null);
@@ -127,12 +139,12 @@ export default function DeploymentForm() {
       clearTimeout(domainCheckTimer.current);
     }
 
-    if (mode !== "prod" || !domain.trim() || domain.trim().length < 3) {
+    if (mode !== "prod" && mode !== "subdomain") {
       return;
     }
 
-    // Must contain at least one dot to be a valid domain
-    if (!domain.includes(".")) {
+    const toCheck = effectiveDomain;
+    if (!toCheck || toCheck.length < 3 || !toCheck.includes(".")) {
       return;
     }
 
@@ -140,7 +152,7 @@ export default function DeploymentForm() {
 
     domainCheckTimer.current = setTimeout(async () => {
       try {
-        const result = await checkDomain(domain.trim());
+        const result = await checkDomain(toCheck);
         setDomainStatus(result.status);
         if (result.status === "available" && result.price_amount != null) {
           setDomainPrice(
@@ -158,7 +170,7 @@ export default function DeploymentForm() {
         clearTimeout(domainCheckTimer.current);
       }
     };
-  }, [domain, mode]);
+  }, [effectiveDomain, mode]);
 
   // Auto-slugify website name: lowercase, replace spaces/underscores with hyphens,
   // remove non-alphanumeric characters (except hyphens), collapse multiple hyphens.
@@ -174,10 +186,10 @@ export default function DeploymentForm() {
     setWebsiteName(slugify(e.target.value));
   }, []);
 
-  // Domain is valid if: not prod, or owned, or external (GoDaddy etc.),
+  // Domain is valid if: not prod/subdomain, or owned, or external (GoDaddy etc.),
   // or (available + confirmed), or no check has run yet (null)
   const domainValid =
-    mode !== "prod" ||
+    (mode !== "prod" && mode !== "subdomain") ||
     domainStatus === null ||
     domainStatus === "owned" ||
     domainStatus === "external" ||
@@ -187,6 +199,12 @@ export default function DeploymentForm() {
   const hasGitSource = Boolean(gitContext);
   const hasUpload = uploadData && uploadData.files.length > 0;
 
+  const subdomainValid =
+    mode !== "subdomain" ||
+    (subdomainLabel.trim().length > 0 &&
+      parentDomain.trim().length > 0 &&
+      parentDomain.includes("."));
+
   const canSubmit =
     (hasUpload || hasGitSource) &&
     websiteName.trim().length > 0 &&
@@ -194,6 +212,7 @@ export default function DeploymentForm() {
     deployerLastName.trim().length > 0 &&
     deployerEmail.trim().length > 0 &&
     (mode !== "prod" || domain.trim().length > 0) &&
+    subdomainValid &&
     domainValid;
 
   // Preview handler
@@ -244,6 +263,16 @@ export default function DeploymentForm() {
       setSubmitting(true);
       setError(null);
 
+      // Subdomain UI mode is translated to backend mode=prod with composed domain.
+      // prod_deployer detects the parent Cloud DNS zone and adds an A record.
+      const backendMode = mode === "subdomain" ? "prod" : mode;
+      const backendDomain =
+        mode === "subdomain"
+          ? composedSubdomainFqdn
+          : mode === "prod"
+            ? domain.trim()
+            : "";
+
       try {
         // ── Git deployment path ──────────────────────────────────────
         if (gitContext) {
@@ -251,7 +280,7 @@ export default function DeploymentForm() {
             connection_id: gitContext.connection.id,
             commit_sha: fromGitCommit || gitContext.event.commit_sha,
             push_event_id: gitContext.event.id,
-            mode,
+            mode: backendMode,
             website_name: websiteName.trim(),
             deployer_first_name: deployerFirstName.trim(),
             deployer_last_name: deployerLastName.trim(),
@@ -260,8 +289,8 @@ export default function DeploymentForm() {
             domain_purchase_confirmed: domainPurchaseConfirmed,
             notification_emails: notificationEmails.trim() || "",
           };
-          if (mode === "prod" && domain.trim()) {
-            body.domain = domain.trim();
+          if (backendDomain) {
+            body.domain = backendDomain;
           }
           const data = await deployFromGit(body);
           navigate(`/deployments/${data.deployment_id}`);
@@ -280,15 +309,15 @@ export default function DeploymentForm() {
           }
         }
 
-        formData.append("mode", mode);
+        formData.append("mode", backendMode);
         formData.append("website_name", websiteName.trim());
         formData.append("deployer_first_name", deployerFirstName.trim());
         formData.append("deployer_last_name", deployerLastName.trim());
         formData.append("deployer_email", deployerEmail.trim());
         formData.append("ai_enabled", aiEnabled ? "true" : "false");
 
-        if (mode === "prod" && domain.trim()) {
-          formData.append("domain", domain.trim());
+        if (backendDomain) {
+          formData.append("domain", backendDomain);
           if (domainPurchaseConfirmed) {
             formData.append("domain_purchase_confirmed", "true");
           }
@@ -315,7 +344,7 @@ export default function DeploymentForm() {
         setSubmitting(false);
       }
     },
-    [canSubmit, submitting, uploadData, mode, websiteName, domain, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate, gitContext, fromGitCommit]
+    [canSubmit, submitting, uploadData, mode, websiteName, domain, parentDomain, subdomainLabel, composedSubdomainFqdn, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate, gitContext, fromGitCommit]
   );
 
   return (
@@ -458,6 +487,20 @@ export default function DeploymentForm() {
                   </button>
                   <button
                     type="button"
+                    onClick={() => setMode("subdomain")}
+                    className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all ${
+                      mode === "subdomain"
+                        ? "border-indigo-600 bg-indigo-600 text-white shadow-md"
+                        : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
+                    }`}
+                  >
+                    Subdomain
+                    <span className="block text-xs font-normal mt-0.5 opacity-80">
+                      Zone DNS existante
+                    </span>
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setMode("cloudrun")}
                     className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all ${
                       mode === "cloudrun"
@@ -571,6 +614,95 @@ export default function DeploymentForm() {
                     nameservers pour pointer vers Google Cloud DNS. Les nameservers
                     seront affich&eacute;s dans les logs du d&eacute;ploiement.
                   </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Subdomain mode fields */}
+          {mode === "subdomain" && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-5 gap-3 items-end">
+                <div className="col-span-2">
+                  <label
+                    htmlFor="subdomain-label"
+                    className="block text-sm font-medium text-gray-700 mb-1"
+                  >
+                    Sous-domaine <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    id="subdomain-label"
+                    type="text"
+                    value={subdomainLabel}
+                    onChange={(e) => setSubdomainLabel(slugify(e.target.value))}
+                    placeholder="blog"
+                    className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
+                      focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent
+                      placeholder-gray-400"
+                    required
+                  />
+                </div>
+                <div className="flex items-center justify-center pb-3 text-gray-400 font-medium">.</div>
+                <div className="col-span-2">
+                  <label
+                    htmlFor="parent-domain"
+                    className="block text-sm font-medium text-gray-700 mb-1"
+                  >
+                    Domaine parent <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    id="parent-domain"
+                    type="text"
+                    value={parentDomain}
+                    onChange={(e) => setParentDomain(e.target.value.trim().toLowerCase())}
+                    placeholder="example.com"
+                    className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
+                      focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent
+                      placeholder-gray-400"
+                    required
+                  />
+                </div>
+              </div>
+
+              <p className="text-xs text-gray-500">
+                Le domaine parent doit d&eacute;j&agrave; avoir une zone DNS dans Cloud DNS / Cloud Domains.
+                Un enregistrement <span className="font-mono">A</span> sera ajout&eacute; automatiquement
+                pour <span className="font-mono">{composedSubdomainFqdn || "sousdomaine.domaine.com"}</span>.
+              </p>
+
+              {composedSubdomainFqdn && (
+                <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-lg">
+                  <div className="text-sm text-indigo-700">
+                    URL cible : <span className="font-mono font-semibold">https://{composedSubdomainFqdn}/</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Status indicator for parent-zone existence */}
+              {domainStatus === "checking" && (
+                <div className="flex items-center gap-2 text-sm text-gray-500">
+                  <Loader className="w-4 h-4 animate-spin" />
+                  V&eacute;rification de la zone DNS parente...
+                </div>
+              )}
+              {domainStatus === "owned" && (
+                <div className="flex items-center gap-2 text-sm text-emerald-600">
+                  <CheckCircle className="w-4 h-4" />
+                  Zone DNS de <span className="font-mono">{parentDomain}</span> trouv&eacute;e &mdash; l&apos;enregistrement A sera ajout&eacute; automatiquement.
+                </div>
+              )}
+              {domainStatus === "external" && (
+                <div className="flex items-center gap-2 text-sm text-amber-600">
+                  <AlertTriangle className="w-4 h-4" />
+                  Aucune zone DNS trouv&eacute;e pour <span className="font-mono">{parentDomain}</span> dans ce projet GCP.
+                  Le d&eacute;ploiement cr&eacute;era une zone d&eacute;di&eacute;e (nameservers &agrave; configurer chez le registrar).
+                </div>
+              )}
+              {domainStatus === "available" && (
+                <div className="flex items-center gap-2 text-sm text-amber-600">
+                  <AlertTriangle className="w-4 h-4" />
+                  Le domaine parent <span className="font-mono">{parentDomain}</span> n&apos;est pas enregistr&eacute; &mdash;
+                  utilisez plut&ocirc;t le mode Production pour l&apos;acheter.
                 </div>
               )}
             </div>

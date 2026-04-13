@@ -271,6 +271,43 @@ def list_users(db: FirestoreClient) -> list[SimpleNamespace]:
     return results
 
 
+def update_user_role(db: FirestoreClient, uid: str, role: str) -> None:
+    """Change the effective role of a user (admin action)."""
+    db.collection(_USERS).document(uid).update({"role": role})
+
+
+def delete_user(db: FirestoreClient, uid: str) -> None:
+    """Permanently delete a user's Firestore document."""
+    db.collection(_USERS).document(uid).delete()
+
+
+def create_user_approved(
+    db: FirestoreClient,
+    *,
+    uid: str,
+    email: str,
+    display_name: str,
+    role: str,
+    approved_by: str = "admin",
+) -> SimpleNamespace:
+    """Create a user already approved with a given role (admin-initiated)."""
+    now = datetime.now(timezone.utc)
+    data = {
+        "email": email,
+        "display_name": display_name,
+        "role": role,
+        "status": UserStatus.APPROVED.value,
+        "requested_role": role,
+        "created_at": now,
+        "approved_at": now,
+        "approved_by": approved_by,
+    }
+    db.collection(_USERS).document(uid).set(data)
+    data["uid"] = uid
+    data["id"] = uid
+    return SimpleNamespace(**data)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Notification Preferences CRUD
 # ═══════════════════════════════════════════════════════════════════════
