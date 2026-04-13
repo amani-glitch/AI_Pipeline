@@ -420,6 +420,13 @@ def list_push_events(
     return results[:limit]
 
 
+def get_push_event(db: FirestoreClient, event_id: str) -> Optional[SimpleNamespace]:
+    doc = db.collection(_PUSH_EVENTS).document(event_id).get()
+    if not doc.exists:
+        return None
+    return _doc_to_record(doc)
+
+
 def mark_push_event_deployed(db: FirestoreClient, event_id: str, deployment_id: str) -> None:
     db.collection(_PUSH_EVENTS).document(event_id).update({
         "deployed": True,

@@ -1,8 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import { useNavigate } from "react-router-dom";
-import { Loader, Rocket, CheckCircle, AlertTriangle, XCircle, Info, Eye, Calendar, X } from "lucide-react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { Loader, Rocket, CheckCircle, AlertTriangle, XCircle, Info, Eye, Calendar, X, GitBranch } from "lucide-react";
 import UploadZone from "./UploadZone";
-import { deployWebsite, checkDomain, createPreview, deletePreview } from "../services/api";
+import {
+  deployWebsite, checkDomain, createPreview, deletePreview,
+  deployFromGit, getGitPushEvents, getGitConnections,
+} from "../services/api";
 import { useAuth } from "../contexts/AuthContext";
 
 /**
@@ -10,7 +13,13 @@ import { useAuth } from "../contexts/AuthContext";
  */
 export default function DeploymentForm() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { userProfile, isSimpleUser } = useAuth();
+
+  // ── Git deployment context (when navigated from /git push event) ──
+  const fromGitEventId = searchParams.get("from_git");
+  const fromGitCommit = searchParams.get("commit");
+  const [gitContext, setGitContext] = useState(null); // { event, connection }
 
   const [uploadData, setUploadData] = useState(null); // { type, files } | null
   const [mode, setMode] = useState("demo");
@@ -52,6 +61,47 @@ export default function DeploymentForm() {
       setMode("demo");
     }
   }, [isSimpleUser]);
+
+  // Load Git deployment context when navigated from /git with ?from_git=XXX
+  useEffect(() => {
+    if (!fromGitEventId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [events, connections] = await Promise.all([
+          getGitPushEvents(),
+          getGitConnections(),
+        ]);
+        const event = events.find((e) => e.id === fromGitEventId);
+        if (!event) {
+          setError("Push event introuvable — redeployment via Git impossible.");
+          return;
+        }
+        const connection = connections.find((c) => c.id === event.connection_id);
+        if (!connection) {
+          setError("Connexion Git introuvable.");
+          return;
+        }
+        if (!cancelled) {
+          setGitContext({ event, connection });
+          // Pre-fill website name from repo name (slugified)
+          if (!websiteName) {
+            const slug = connection.repo_name
+              .toLowerCase()
+              .replace(/[\s_]+/g, "-")
+              .replace(/[^a-z0-9-]/g, "")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "");
+            setWebsiteName(slug);
+          }
+        }
+      } catch (err) {
+        setError("Echec du chargement du contexte Git: " + (err.message || ""));
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fromGitEventId]);
 
   // Auto-populate notification emails when deployer email changes
   useEffect(() => {
@@ -133,9 +183,12 @@ export default function DeploymentForm() {
     domainStatus === "external" ||
     (domainStatus === "available" && domainPurchaseConfirmed);
 
+  // In git mode, no upload is required (source comes from the repo)
+  const hasGitSource = Boolean(gitContext);
+  const hasUpload = uploadData && uploadData.files.length > 0;
+
   const canSubmit =
-    uploadData &&
-    uploadData.files.length > 0 &&
+    (hasUpload || hasGitSource) &&
     websiteName.trim().length > 0 &&
     deployerFirstName.trim().length > 0 &&
     deployerLastName.trim().length > 0 &&
@@ -192,6 +245,30 @@ export default function DeploymentForm() {
       setError(null);
 
       try {
+        // ── Git deployment path ──────────────────────────────────────
+        if (gitContext) {
+          const body = {
+            connection_id: gitContext.connection.id,
+            commit_sha: fromGitCommit || gitContext.event.commit_sha,
+            push_event_id: gitContext.event.id,
+            mode,
+            website_name: websiteName.trim(),
+            deployer_first_name: deployerFirstName.trim(),
+            deployer_last_name: deployerLastName.trim(),
+            deployer_email: deployerEmail.trim(),
+            ai_enabled: aiEnabled,
+            domain_purchase_confirmed: domainPurchaseConfirmed,
+            notification_emails: notificationEmails.trim() || "",
+          };
+          if (mode === "prod" && domain.trim()) {
+            body.domain = domain.trim();
+          }
+          const data = await deployFromGit(body);
+          navigate(`/deployments/${data.deployment_id}`);
+          return;
+        }
+
+        // ── Upload-based deployment path ────────────────────────────
         const formData = new FormData();
 
         if (uploadData.type === "zip") {
@@ -238,7 +315,7 @@ export default function DeploymentForm() {
         setSubmitting(false);
       }
     },
-    [canSubmit, submitting, uploadData, mode, websiteName, domain, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate]
+    [canSubmit, submitting, uploadData, mode, websiteName, domain, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate, gitContext, fromGitCommit]
   );
 
   return (
@@ -246,15 +323,39 @@ export default function DeploymentForm() {
       <div className="mb-8">
         <h1 className="text-3xl font-bold text-gray-900">Deploy Website</h1>
         <p className="mt-2 text-gray-600">
-          Upload your website files and configure the deployment.
+          {gitContext
+            ? "Deploiement depuis Git — pas besoin d'upload."
+            : "Upload your website files and configure the deployment."}
         </p>
       </div>
 
-      {/* Upload Zone */}
-      <UploadZone onFilesSelected={setUploadData} />
+      {/* Git context banner */}
+      {gitContext && (
+        <div className="mb-6 p-4 bg-gray-900 text-white rounded-lg border-2 border-gray-800">
+          <div className="flex items-start gap-3">
+            <GitBranch className="w-5 h-5 text-emerald-400 flex-shrink-0 mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold">
+                {gitContext.connection.provider === "github" ? "GitHub" : "GitLab"} &mdash; {gitContext.connection.repo_name}
+              </div>
+              <div className="mt-1 text-xs text-gray-300 font-mono truncate">
+                {gitContext.event.branch} @ {gitContext.event.commit_sha.substring(0, 12)}
+              </div>
+              {gitContext.event.commit_message && (
+                <div className="mt-1 text-xs text-gray-400 truncate">
+                  {gitContext.event.commit_message}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
-      {/* Configuration form, visible after file selection */}
-      {uploadData && (
+      {/* Upload Zone (hidden in git mode) */}
+      {!gitContext && <UploadZone onFilesSelected={setUploadData} />}
+
+      {/* Configuration form */}
+      {(uploadData || gitContext) && (
         <form onSubmit={handleSubmit} className="mt-8 space-y-6">
           {/* Deployer identity fields */}
           <div className="grid grid-cols-2 gap-4">
@@ -396,58 +497,12 @@ export default function DeploymentForm() {
             <p className="mt-1 text-xs text-gray-500">
               Auto-slugified: lowercase, hyphens only.
             </p>
-            {mode === "subdomain" && websiteName.trim() && (
-              <p className="mt-1.5 text-xs text-violet-600 font-medium">
-                URL: https://{subdomainFqdn}
-              </p>
-            )}
             {mode === "demo" && websiteName.trim() && (
               <p className="mt-1.5 text-xs text-blue-600 font-medium">
                 URL: https://digitaldatatest.com/{websiteName.trim()}/
               </p>
             )}
           </div>
-
-          {/* Parent Domain (subdomain mode) */}
-          {mode === "subdomain" && (
-            <div>
-              <label
-                htmlFor="parent-domain"
-                className="block text-sm font-medium text-gray-700 mb-1"
-              >
-                Domaine parent
-              </label>
-              <input
-                id="parent-domain"
-                type="text"
-                value={domain}
-                onChange={(e) => setDomain(e.target.value)}
-                placeholder="yourlocaleye.com"
-                className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
-                  focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent
-                  placeholder-gray-400"
-              />
-              <p className="mt-1 text-xs text-gray-500">
-                Laissez vide pour utiliser digitaldatatest.com. Pour un domaine externe
-                (GoDaddy, OVH...), vous devrez ajouter un enregistrement DNS A ou CNAME
-                apr&egrave;s le d&eacute;ploiement.
-              </p>
-              {domain.trim() && domain.trim() !== "digitaldatatest.com" && (
-                <div className="mt-2 p-3 bg-violet-50 border border-violet-200 rounded-lg">
-                  <div className="flex items-center gap-2 text-sm text-violet-700">
-                    <Info className="w-4 h-4 flex-shrink-0" />
-                    Domaine externe d&eacute;tect&eacute;
-                  </div>
-                  <p className="mt-1.5 text-xs text-violet-600 ml-6">
-                    Apr&egrave;s le d&eacute;ploiement, ajoutez chez votre registrar :<br />
-                    <code className="bg-violet-100 px-1.5 py-0.5 rounded text-xs font-mono">
-                      {websiteName.trim() || "subdomain"}.{domain.trim()} → A record vers l'IP du load balancer
-                    </code>
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
 
           {/* Domain (prod mode only) */}
           {mode === "prod" && (
@@ -664,6 +719,11 @@ export default function DeploymentForm() {
                 <>
                   <Calendar className="w-5 h-5" />
                   Planifier
+                </>
+              ) : gitContext ? (
+                <>
+                  <GitBranch className="w-5 h-5" />
+                  Deploy from Git
                 </>
               ) : (
                 <>

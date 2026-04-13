@@ -13,7 +13,8 @@ import zipfile
 from typing import Optional
 
 import aiofiles
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
+from pydantic import BaseModel, Field
 from config import Settings, get_settings
 from db.database import get_db
 from db import crud
@@ -272,6 +273,199 @@ async def create_deployment(
     )
 
     logger.info("Deployment %s queued (mode=%s, website=%s)", deployment_id, mode, website_name_lower)
+    return DeploymentCreateResponse(deployment_id=deployment_id, status="queued")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  POST /api/deploy/from-git — deploy a commit from a connected Git repo
+# ═══════════════════════════════════════════════════════════════════════
+
+class DeployFromGitRequest(BaseModel):
+    """Request body for /api/deploy/from-git."""
+    connection_id: str = Field(..., description="Git connection ID")
+    commit_sha: str = Field(..., description="Commit SHA or branch/tag ref")
+    push_event_id: Optional[str] = Field(None, description="Optional push event to mark as deployed")
+    mode: str
+    website_name: str
+    domain: Optional[str] = None
+    notification_emails: Optional[str] = ""
+    deployer_first_name: str = ""
+    deployer_last_name: str = ""
+    deployer_email: str = ""
+    ai_enabled: bool = False
+    domain_purchase_confirmed: bool = False
+
+
+@router.post(
+    "/deploy/from-git",
+    response_model=DeploymentCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_deployment_from_git(
+    body: DeployFromGitRequest,
+    user=Depends(require_approved),
+    db=Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> DeploymentCreateResponse:
+    """
+    Download a snapshot of a Git commit via the provider API (GitHub/GitLab),
+    package it as a ZIP, and kick off the deployment pipeline.
+
+    Auth / permissions:
+    - Requires an approved user.
+    - Only ``super_user`` and ``admin`` can use Git deployments.
+    - The authenticated user must own the git connection (or be admin).
+    """
+    from services.git_service import download_repo_as_zip, GitDownloadError
+    from db import crud as crud_module
+    from models.enums import UserRole
+
+    # ── Role check ────────────────────────────────────────────────────
+    if user.role == UserRole.SIMPLE_USER.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Git deployments require super_user or admin role.",
+        )
+
+    # ── Validate mode ─────────────────────────────────────────────────
+    if body.mode not in (DeploymentMode.DEMO.value, DeploymentMode.PROD.value, DeploymentMode.CLOUDRUN.value):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid mode '{body.mode}'.",
+        )
+    require_deploy_permission(body.mode, user)
+
+    # ── Quotas ────────────────────────────────────────────────────────
+    from api.routes.quotas import check_quota
+    check_quota(db, user)
+
+    # ── Validate website_name ─────────────────────────────────────────
+    website_name_lower = body.website_name.lower().strip()
+    if len(website_name_lower) < 2 or not _SLUG_RE.match(website_name_lower):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid website_name '{body.website_name}'.",
+        )
+
+    # ── Domain for prod ───────────────────────────────────────────────
+    if body.mode == DeploymentMode.PROD.value and not body.domain:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A domain is required for production deployments.",
+        )
+
+    # ── Lookup git connection ────────────────────────────────────────
+    conn = crud_module.get_git_connection(db, body.connection_id)
+    if conn is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Git connection '{body.connection_id}' not found.",
+        )
+    if conn.uid != user.uid and user.role != UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only deploy from your own Git connections.",
+        )
+
+    # ── Download repo snapshot ───────────────────────────────────────
+    deployment_id = str(uuid.uuid4())
+    zip_dest = settings.upload_path / f"{deployment_id}.zip"
+
+    try:
+        await asyncio.to_thread(
+            download_repo_as_zip,
+            provider=conn.provider,
+            repo_url=conn.repo_url,
+            ref=body.commit_sha,
+            access_token=conn.access_token,
+            dest_zip_path=zip_dest,
+        )
+    except GitDownloadError as exc:
+        logger.exception("Git download failed for deployment %s", deployment_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to download repo: {exc}",
+        ) from exc
+
+    stored_zip_filename = f"{conn.repo_name}-{body.commit_sha[:8]}.zip"
+
+    # ── Backup ZIP to GCS ────────────────────────────────────────────
+    try:
+        await asyncio.to_thread(backup_zip, settings, deployment_id, zip_dest)
+    except Exception:
+        logger.warning("GCS ZIP backup failed for %s (non-fatal)", deployment_id, exc_info=True)
+
+    # ── Notification emails ──────────────────────────────────────────
+    email_list: list[str] = []
+    if body.notification_emails:
+        email_list = [e.strip() for e in body.notification_emails.split(",") if e.strip()]
+    deployer_email_stripped = (body.deployer_email or getattr(user, "email", "")).strip()
+    if deployer_email_stripped and deployer_email_stripped not in email_list:
+        email_list.append(deployer_email_stripped)
+    all_emails_str = ", ".join(email_list) if email_list else ""
+
+    # ── Deployer fields fallback to user profile ─────────────────────
+    first_name = body.deployer_first_name.strip()
+    last_name = body.deployer_last_name.strip()
+    if not first_name and hasattr(user, "display_name") and user.display_name:
+        parts = user.display_name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else last_name
+
+    # ── DB record ────────────────────────────────────────────────────
+    crud.create_deployment(
+        db,
+        deployment_id=deployment_id,
+        website_name=website_name_lower,
+        mode=body.mode,
+        domain=body.domain,
+        notification_emails=all_emails_str,
+        zip_filename=stored_zip_filename,
+        deployer_first_name=first_name,
+        deployer_last_name=last_name,
+        deployer_email=deployer_email_stripped,
+        ai_enabled=body.ai_enabled,
+    )
+
+    # Tag deployment with git metadata for traceability
+    db.collection("deployments").document(deployment_id).update({
+        "git_connection_id": conn.id,
+        "git_commit_sha": body.commit_sha,
+        "git_repo_name": conn.repo_name,
+        "git_branch": conn.branch,
+    })
+
+    # ── Pipeline config ──────────────────────────────────────────────
+    deploy_config = DeploymentConfig(
+        mode=DeploymentMode(body.mode),
+        website_name=website_name_lower,
+        domain=body.domain,
+        notification_emails=email_list,
+        deployer_first_name=first_name,
+        deployer_last_name=last_name,
+        deployer_email=deployer_email_stripped,
+        ai_enabled=body.ai_enabled,
+        domain_purchase_confirmed=body.domain_purchase_confirmed,
+    )
+
+    # ── Mark the push event as deployed (if provided) ────────────────
+    if body.push_event_id:
+        try:
+            crud_module.mark_push_event_deployed(db, body.push_event_id, deployment_id)
+        except Exception:
+            logger.warning("Failed to mark push event %s as deployed", body.push_event_id, exc_info=True)
+
+    # ── Launch pipeline ──────────────────────────────────────────────
+    orchestrator = PipelineOrchestrator(settings)
+    asyncio.create_task(
+        orchestrator.run(deployment_id, str(zip_dest), deploy_config),
+        name=f"pipeline-{deployment_id[:8]}",
+    )
+
+    logger.info(
+        "Git deployment %s queued (repo=%s, commit=%s, mode=%s)",
+        deployment_id, conn.repo_name, body.commit_sha[:12], body.mode,
+    )
     return DeploymentCreateResponse(deployment_id=deployment_id, status="queued")
 
 

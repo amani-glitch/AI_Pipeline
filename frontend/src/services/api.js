@@ -24,6 +24,19 @@ export async function deployWebsite(formData) {
 }
 
 /**
+ * Deploy from a Git commit (no upload needed).
+ * @param {object} body - { connection_id, commit_sha, push_event_id?, mode,
+ *   website_name, domain?, notification_emails?, deployer_*, ai_enabled,
+ *   domain_purchase_confirmed }
+ */
+export async function deployFromGit(body) {
+  const response = await api.post("/api/deploy/from-git", body, {
+    timeout: 180000,
+  });
+  return response.data;
+}
+
+/**
  * List all deployments.
  * @returns {Promise<object[]>} Array of deployment objects.
  */
