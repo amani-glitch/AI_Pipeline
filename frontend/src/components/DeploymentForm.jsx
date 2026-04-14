@@ -186,11 +186,13 @@ export default function DeploymentForm() {
     setWebsiteName(slugify(e.target.value));
   }, []);
 
-  // Domain is valid if: not prod/subdomain, or owned, or external (GoDaddy etc.),
-  // or (available + confirmed), or no check has run yet (null)
+  // Domain is valid if: not prod/subdomain, or check pending/passed, or external.
+  // "checking" is allowed so the deploy button isn't blocked while the API responds
+  // — the backend validates domain ownership independently.
   const domainValid =
     (mode !== "prod" && mode !== "subdomain") ||
     domainStatus === null ||
+    domainStatus === "checking" ||
     domainStatus === "owned" ||
     domainStatus === "external" ||
     (domainStatus === "available" && domainPurchaseConfirmed);
