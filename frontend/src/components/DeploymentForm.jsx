@@ -621,6 +621,37 @@ export default function DeploymentForm() {
             </div>
           )}
 
+          {/* Prod mode — what the platform will provision */}
+          {mode === "prod" && (
+            <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg">
+              <h4 className="text-sm font-semibold text-emerald-800 mb-2">
+                Ressources provisionnees automatiquement
+              </h4>
+              <ul className="space-y-1.5 text-xs text-emerald-700">
+                <li className="flex items-start gap-2">
+                  <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span><strong>Bucket GCS</strong> + Backend Bucket avec <strong>CDN</strong> active</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span><strong>Certificat SSL</strong> Google-managed (provisionnement auto, jusqu&apos;a 24h)</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span><strong>Zone DNS</strong> Cloud DNS + records <code className="bg-emerald-100 px-1 rounded">A</code> et <code className="bg-emerald-100 px-1 rounded">CNAME (www)</code></span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span>Ajout au <strong>Load Balancer</strong> partage (host rule + path matcher)</span>
+                </li>
+              </ul>
+              <p className="mt-2.5 text-[11px] text-emerald-600">
+                Apres le deploiement, les nameservers Google Cloud DNS seront affiches
+                pour configuration chez votre registrar.
+              </p>
+            </div>
+          )}
+
           {/* Subdomain mode fields */}
           {mode === "subdomain" && (
             <div className="space-y-3">

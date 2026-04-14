@@ -543,13 +543,28 @@ class PipelineOrchestrator:
         ctx.result_url = result.url
         ctx.bucket_name = result.storage_bucket
 
-        # Store DNS nameservers (for external domain instructions in UI)
         if result.dns_nameservers:
             ctx.dns_nameservers = result.dns_nameservers
-            db = SessionLocal()
-            db.collection("deployments").document(ctx.deployment_id).update({
-                "dns_nameservers": result.dns_nameservers,
-            })
+
+        # Store infrastructure details in Firestore for the UI
+        is_prod = ctx.config.mode == DeploymentMode.PROD
+        infra_update: dict = {
+            "storage_bucket": result.storage_bucket or "",
+            "backend_bucket": result.backend_bucket or "",
+            "infra_details": {
+                "ssl_cert_created": bool(is_prod and self._settings.PROD_AUTO_CREATE_SSL_CERT),
+                "dns_zone_created": bool(is_prod and self._settings.PROD_AUTO_CREATE_DNS_ZONE),
+                "cdn_enabled": ctx.config.mode != DeploymentMode.CLOUDRUN,
+                "lb_name": (
+                    self._settings.PROD_URL_MAP_NAME if is_prod
+                    else self._settings.DEMO_URL_MAP_NAME
+                ),
+            },
+        }
+        if result.dns_nameservers:
+            infra_update["dns_nameservers"] = result.dns_nameservers
+        db = SessionLocal()
+        db.collection("deployments").document(ctx.deployment_id).update(infra_update)
 
     async def _step_upload(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.config.mode == DeploymentMode.CLOUDRUN:

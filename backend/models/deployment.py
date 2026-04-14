@@ -104,6 +104,9 @@ class DeploymentResponse(BaseModel):
     ai_enabled: bool = False
     ai_token_usage: Optional[str] = None
     dns_nameservers: list[str] = []
+    storage_bucket: Optional[str] = None
+    backend_bucket: Optional[str] = None
+    infra_details: Optional[dict] = None
     created_at: Optional[datetime]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -135,6 +138,9 @@ class DeploymentResponse(BaseModel):
             ai_enabled=getattr(rec, "ai_enabled", False),
             ai_token_usage=getattr(rec, "ai_token_usage", None),
             dns_nameservers=getattr(rec, "dns_nameservers", []) or [],
+            storage_bucket=getattr(rec, "storage_bucket", None),
+            backend_bucket=getattr(rec, "backend_bucket", None),
+            infra_details=getattr(rec, "infra_details", None),
             created_at=rec.created_at,
             started_at=rec.started_at,
             completed_at=rec.completed_at,

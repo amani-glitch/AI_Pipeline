@@ -9,6 +9,10 @@ import {
   Copy,
   Check,
   Server,
+  Shield,
+  Database,
+  Zap,
+  Link2,
 } from "lucide-react";
 
 /**
@@ -384,6 +388,97 @@ export default function DeploymentStatus({ deployment }) {
         </div>
       )}
 
+      {/* Infrastructure recap card (prod/subdomain deployments) */}
+      {isSuccess && deployment.mode === "prod" && (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-gray-50 px-6 py-3 border-b border-gray-200">
+            <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+              <Server className="w-4 h-4 text-gray-500" />
+              Ressources GCP provisionnees
+            </h3>
+          </div>
+          <div className="p-6">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Domain */}
+              {deployment.domain && (
+                <div className="flex items-start gap-3">
+                  <Globe className="w-4 h-4 text-emerald-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Domaine</dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900">{deployment.domain}</dd>
+                  </div>
+                </div>
+              )}
+
+              {/* Storage Bucket */}
+              {deployment.storage_bucket && (
+                <div className="flex items-start gap-3">
+                  <Database className="w-4 h-4 text-blue-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Bucket GCS</dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900 break-all">{deployment.storage_bucket}</dd>
+                  </div>
+                </div>
+              )}
+
+              {/* CDN */}
+              {deployment.backend_bucket && (
+                <div className="flex items-start gap-3">
+                  <Zap className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">CDN (Backend Bucket)</dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900 break-all">{deployment.backend_bucket}</dd>
+                  </div>
+                </div>
+              )}
+
+              {/* Load Balancer */}
+              {deployment.infra_details?.lb_name && (
+                <div className="flex items-start gap-3">
+                  <Link2 className="w-4 h-4 text-purple-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Load Balancer</dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900">{deployment.infra_details.lb_name}</dd>
+                  </div>
+                </div>
+              )}
+
+              {/* SSL */}
+              {deployment.infra_details?.ssl_cert_created && (
+                <div className="flex items-start gap-3">
+                  <Shield className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Certificat SSL</dt>
+                    <dd className="text-sm font-medium text-gray-900">
+                      Google-managed
+                      <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-100 text-green-700">
+                        Auto-provisionne
+                      </span>
+                    </dd>
+                  </div>
+                </div>
+              )}
+
+              {/* DNS Zone */}
+              {deployment.infra_details?.dns_zone_created && (
+                <div className="flex items-start gap-3">
+                  <Globe className="w-4 h-4 text-indigo-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Zone DNS</dt>
+                    <dd className="text-sm font-medium text-gray-900">
+                      Cloud DNS
+                      <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-100 text-indigo-700">
+                        Records A + CNAME
+                      </span>
+                    </dd>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Metadata card */}
       <div className="bg-white rounded-xl border border-gray-200 p-6">
         <h3 className="text-sm font-semibold text-gray-700 mb-4">
@@ -413,6 +508,20 @@ export default function DeploymentStatus({ deployment }) {
               </dd>
             </div>
           </div>
+
+          {deployment.domain && (
+            <div className="flex items-start gap-3">
+              <Globe className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" />
+              <div>
+                <dt className="text-xs text-gray-500 uppercase tracking-wide">
+                  Domain
+                </dt>
+                <dd className="text-sm font-medium text-gray-900">
+                  {deployment.domain}
+                </dd>
+              </div>
+            </div>
+          )}
 
           <div className="flex items-start gap-3">
             <Clock className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" />

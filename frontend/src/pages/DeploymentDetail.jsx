@@ -23,6 +23,9 @@ function normalizeDeployment(d) {
     url: d.result_url || d.url,
     ai_summary: d.claude_summary || d.ai_summary,
     dns_nameservers: d.dns_nameservers || [],
+    storage_bucket: d.storage_bucket || null,
+    backend_bucket: d.backend_bucket || null,
+    infra_details: d.infra_details || null,
   };
 }
 
