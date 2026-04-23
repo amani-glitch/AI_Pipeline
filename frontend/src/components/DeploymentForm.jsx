@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Loader, Rocket, CheckCircle, AlertTriangle, XCircle, Info, Eye, Calendar, X, GitBranch } from "lucide-react";
 import UploadZone from "./UploadZone";
+import QuotaRequestModal from "./QuotaRequestModal";
 import {
   deployWebsite, checkDomain, createPreview, deletePreview,
   deployFromGit, getGitPushEvents, getGitConnections,
@@ -38,6 +39,8 @@ export default function DeploymentForm() {
   const domainCheckTimer = useRef(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [quotaModalOpen, setQuotaModalOpen] = useState(false);
+  const [quotaModalMessage, setQuotaModalMessage] = useState("");
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewData, setPreviewData] = useState(null); // { preview_id, url }
   const [scheduledAt, setScheduledAt] = useState("");
@@ -341,7 +344,13 @@ export default function DeploymentForm() {
           err.response?.data?.detail ||
           err.message ||
           "Deployment failed. Please try again.";
-        setError(typeof detail === "string" ? detail : JSON.stringify(detail));
+        const detailStr = typeof detail === "string" ? detail : JSON.stringify(detail);
+        setError(detailStr);
+        // If the backend returned a quota error (HTTP 429), open the request modal
+        if (err.response?.status === 429) {
+          setQuotaModalMessage(detailStr);
+          setQuotaModalOpen(true);
+        }
       } finally {
         setSubmitting(false);
       }
@@ -837,6 +846,18 @@ export default function DeploymentForm() {
           {error && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
               <p className="text-sm text-red-700">{error}</p>
+              {/Quota/i.test(error) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQuotaModalMessage(error);
+                    setQuotaModalOpen(true);
+                  }}
+                  className="mt-2 text-xs font-medium text-indigo-700 hover:text-indigo-900 underline cursor-pointer"
+                >
+                  Demander une augmentation de quota
+                </button>
+              )}
             </div>
           )}
 
@@ -900,6 +921,12 @@ export default function DeploymentForm() {
           </div>
         </form>
       )}
+
+      <QuotaRequestModal
+        open={quotaModalOpen}
+        onClose={() => setQuotaModalOpen(false)}
+        triggerMessage={quotaModalMessage}
+      />
 
       {/* Preview Modal */}
       {previewData && (

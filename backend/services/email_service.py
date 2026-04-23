@@ -490,6 +490,73 @@ _APPROVAL_REQUEST_TEMPLATE = Template("""\
 """)
 
 
+# ── Quota increase request email template ───────────────────────────
+_QUOTA_REQUEST_TEMPLATE = Template("""\
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demande d'augmentation de quota</title>
+<style>
+  body { margin: 0; padding: 0; background-color: #f4f6f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+  .container { max-width: 600px; margin: 40px auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+  .header { padding: 24px 32px; background: linear-gradient(135deg, #6366f1, #4338ca); color: #ffffff; }
+  .header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .body { padding: 28px 32px; color: #1f2937; }
+  .field { margin-bottom: 16px; }
+  .field-label { font-size: 12px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .field-value { font-size: 15px; color: #111827; }
+  .box { background: #f9fafb; border-left: 4px solid #6366f1; padding: 14px 18px; margin: 12px 0; border-radius: 0 6px 6px 0; font-size: 13px; color: #374151; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+  td { padding: 6px 10px; font-size: 13px; border-bottom: 1px solid #f3f4f6; }
+  td.k { color: #6b7280; width: 55%; }
+  td.v { color: #111827; font-weight: 600; text-align: right; }
+  .cta { display: inline-block; margin-top: 16px; padding: 10px 24px; background: #6366f1; color: #ffffff; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px; }
+  .footer { padding: 16px 32px; background: #f9fafb; text-align: center; font-size: 12px; color: #9ca3af; border-top: 1px solid #e5e7eb; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>&#128200; Demande d'augmentation de quota</h1>
+  </div>
+  <div class="body">
+    <div class="field">
+      <div class="field-label">Utilisateur</div>
+      <div class="field-value">{{ display_name }} &lt;{{ user_email }}&gt;</div>
+    </div>
+    <div class="field">
+      <div class="field-label">R&ocirc;le actuel</div>
+      <div class="field-value">{{ role }}</div>
+    </div>
+
+    <div class="field-label" style="margin-top:18px;">Quota actuel &rarr; demand&eacute;</div>
+    <table>
+      {% for k, label in fields %}
+      <tr>
+        <td class="k">{{ label }}</td>
+        <td class="v">{{ current.get(k, '-') }} &rarr; <span style="color:#4338ca;">{{ requested.get(k, '-') }}</span></td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    {% if reason %}
+    <div class="field-label" style="margin-top:18px;">Justification</div>
+    <div class="box">{{ reason }}</div>
+    {% endif %}
+
+    <a href="{{ admin_url }}" class="cta">Ouvrir le tableau des quotas</a>
+  </div>
+  <div class="footer">
+    Envoy&eacute; par <strong>WebDeploy</strong>
+  </div>
+</div>
+</body>
+</html>
+""")
+
+
 # ── Status notification email template ────────────────────────────────
 _STATUS_NOTIFICATION_TEMPLATE = Template("""\
 <!DOCTYPE html>
@@ -656,6 +723,58 @@ class EmailService:
         except Exception as exc:
             self._log(f"Failed to send status notification: {exc}", level="ERROR")
             logger.exception("Status notification email failed")
+            return False
+
+    # ── Quota increase request ─────────────────────────────────────────
+
+    async def send_quota_increase_request(
+        self,
+        *,
+        admin_emails: list[str],
+        display_name: str,
+        user_email: str,
+        role: str,
+        current_quota: dict,
+        requested_quota: dict,
+        reason: str,
+        admin_url: str,
+    ) -> bool:
+        """Notify admins that a user has requested a quota increase."""
+        recipients = [e for e in (admin_emails or []) if e]
+        if not recipients or not self._is_gmail_configured():
+            return False
+
+        role_labels = {
+            "simple_user": "Utilisateur Simple",
+            "super_user": "Super Utilisateur",
+            "admin": "Administrateur",
+        }
+        fields = [
+            ("max_deployments_per_day", "Deploiements / jour"),
+            ("max_concurrent_deployments", "Deploiements simultanes"),
+            ("max_total_deployments", "Total deploiements"),
+            ("max_zip_size_mb", "Taille ZIP max (MB)"),
+        ]
+
+        try:
+            subject = f"[WebDeploy] Demande de quota — {display_name or user_email}"
+            html_body = _QUOTA_REQUEST_TEMPLATE.render(
+                display_name=display_name or user_email,
+                user_email=user_email,
+                role=role_labels.get(role, role),
+                current=current_quota or {},
+                requested=requested_quota or {},
+                reason=reason or "",
+                fields=fields,
+                admin_url=admin_url,
+            )
+            msg = self._build_html_email(subject, html_body, recipients)
+            await asyncio.to_thread(self._send_via_gmail, msg)
+            self._log(f"Quota request sent to {len(recipients)} admin(s)", level="INFO")
+            return True
+        except Exception as exc:
+            self._log(f"Failed to send quota request: {exc}", level="ERROR")
+            logger.exception("Quota request email failed")
             return False
 
     # ── Daily Report ──────────────────────────────────────────────────

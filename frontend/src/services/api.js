@@ -300,6 +300,34 @@ export async function getMyQuotaUsage() {
   return response.data;
 }
 
+export async function requestQuotaIncrease({ requested_quota, reason }) {
+  const response = await api.post("/api/quotas/request-increase", {
+    requested_quota,
+    reason: reason || "",
+  });
+  return response.data;
+}
+
+export async function listQuotaRequests(params = {}) {
+  const response = await api.get("/api/quotas/requests", { params });
+  return response.data;
+}
+
+export async function getPendingQuotaRequestCount() {
+  const response = await api.get("/api/quotas/requests/pending-count");
+  return response.data;
+}
+
+export async function approveQuotaRequest(id, body = {}) {
+  const response = await api.post(`/api/quotas/requests/${id}/approve`, body);
+  return response.data;
+}
+
+export async function rejectQuotaRequest(id, body = {}) {
+  const response = await api.post(`/api/quotas/requests/${id}/reject`, body);
+  return response.data;
+}
+
 // ── Alerts API ───────────────────────────────────────────────────────
 
 export async function getAlerts(params = {}) {

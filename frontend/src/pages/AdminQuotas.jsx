@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
-import { Loader2, Save, CheckCircle, AlertCircle, Gauge, Users } from "lucide-react";
-import { getQuotaDefaults, setRoleQuota, listUsers, getUserQuota, setUserQuota } from "../services/api";
+import { Loader2, Save, CheckCircle, AlertCircle, Gauge, Users, Inbox, ThumbsUp, ThumbsDown } from "lucide-react";
+import {
+  getQuotaDefaults, setRoleQuota, listUsers, getUserQuota, setUserQuota,
+  listQuotaRequests, approveQuotaRequest, rejectQuotaRequest,
+} from "../services/api";
 
 const ROLE_LABELS = {
   simple_user: "Utilisateur Simple",
@@ -23,15 +26,19 @@ export default function AdminQuotas() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(null);
   const [message, setMessage] = useState(null);
+  const [requests, setRequests] = useState([]);
+  const [processingRequest, setProcessingRequest] = useState(null);
 
   const fetchData = useCallback(async () => {
     try {
-      const [defaults, userList] = await Promise.all([
+      const [defaults, userList, reqs] = await Promise.all([
         getQuotaDefaults(),
         listUsers(),
+        listQuotaRequests(),
       ]);
       setRoleQuotas(defaults);
       setUsers(userList.filter((u) => u.status === "approved"));
+      setRequests(reqs);
     } catch {
     } finally {
       setLoading(false);
@@ -94,6 +101,47 @@ export default function AdminQuotas() {
     }
   };
 
+  const handleApproveRequest = async (req) => {
+    setProcessingRequest(req.id);
+    setMessage(null);
+    try {
+      await approveQuotaRequest(req.id);
+      setRequests((prev) =>
+        prev.map((r) => (r.id === req.id ? { ...r, status: "approved" } : r))
+      );
+      setMessage({
+        type: "success",
+        text: `Demande de ${req.display_name || req.email} approuvee.`,
+      });
+    } catch {
+      setMessage({ type: "error", text: "Impossible d'approuver la demande." });
+    } finally {
+      setProcessingRequest(null);
+    }
+  };
+
+  const handleRejectRequest = async (req) => {
+    setProcessingRequest(req.id);
+    setMessage(null);
+    try {
+      await rejectQuotaRequest(req.id);
+      setRequests((prev) =>
+        prev.map((r) => (r.id === req.id ? { ...r, status: "rejected" } : r))
+      );
+      setMessage({
+        type: "success",
+        text: `Demande de ${req.display_name || req.email} rejetee.`,
+      });
+    } catch {
+      setMessage({ type: "error", text: "Impossible de rejeter la demande." });
+    } finally {
+      setProcessingRequest(null);
+    }
+  };
+
+  const pendingRequests = requests.filter((r) => r.status === "pending");
+  const reviewedRequests = requests.filter((r) => r.status !== "pending");
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-20">
@@ -123,6 +171,126 @@ export default function AdminQuotas() {
           {message.text}
         </div>
       )}
+
+      {/* Quota increase requests */}
+      <div className="space-y-4">
+        <h2 className="font-semibold text-gray-900 flex items-center gap-2">
+          <Inbox className="w-5 h-5 text-indigo-600" />
+          Demandes d'augmentation
+          {pendingRequests.length > 0 && (
+            <span className="px-2 py-0.5 text-xs font-semibold bg-indigo-100 text-indigo-700 rounded-full">
+              {pendingRequests.length}
+            </span>
+          )}
+        </h2>
+
+        {pendingRequests.length === 0 && reviewedRequests.length === 0 ? (
+          <div className="bg-white rounded-lg border border-gray-200 p-6 text-sm text-gray-500 text-center">
+            Aucune demande pour le moment.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {pendingRequests.map((req) => (
+              <div key={req.id} className="bg-white rounded-lg border border-indigo-200 p-5 shadow-sm">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-gray-900">
+                        {req.display_name || req.email}
+                      </span>
+                      <span className="text-xs text-gray-500">{req.email}</span>
+                      <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-700 rounded">
+                        {ROLE_LABELS[req.role] || req.role}
+                      </span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                      {Object.entries(FIELD_LABELS).map(([field, label]) => {
+                        const from = req.current_quota?.[field];
+                        const to = req.requested_quota?.[field];
+                        const changed = from !== to;
+                        return (
+                          <div
+                            key={field}
+                            className={`px-3 py-2 rounded border ${
+                              changed ? "border-indigo-200 bg-indigo-50" : "border-gray-100 bg-gray-50"
+                            }`}
+                          >
+                            <div className="text-[10px] uppercase tracking-wide text-gray-500">{label}</div>
+                            <div className={`mt-0.5 ${changed ? "text-indigo-700 font-semibold" : "text-gray-700"}`}>
+                              {from ?? "-"} &rarr; {to ?? "-"}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {req.reason && (
+                      <p className="mt-3 text-sm text-gray-600 border-l-4 border-indigo-200 pl-3 bg-indigo-50/40 py-1.5 rounded-r">
+                        {req.reason}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex flex-col gap-2 flex-shrink-0">
+                    <button
+                      onClick={() => handleApproveRequest(req)}
+                      disabled={processingRequest === req.id}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 text-white text-sm rounded-lg font-medium hover:bg-emerald-700 disabled:opacity-50 cursor-pointer"
+                    >
+                      {processingRequest === req.id ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <ThumbsUp className="w-3.5 h-3.5" />
+                      )}
+                      Approuver
+                    </button>
+                    <button
+                      onClick={() => handleRejectRequest(req)}
+                      disabled={processingRequest === req.id}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-red-200 text-red-600 text-sm rounded-lg font-medium hover:bg-red-50 disabled:opacity-50 cursor-pointer"
+                    >
+                      <ThumbsDown className="w-3.5 h-3.5" />
+                      Rejeter
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            {reviewedRequests.length > 0 && (
+              <details className="bg-white rounded-lg border border-gray-200 p-4">
+                <summary className="text-sm text-gray-600 cursor-pointer select-none">
+                  Historique ({reviewedRequests.length})
+                </summary>
+                <div className="mt-3 space-y-2">
+                  {reviewedRequests.map((req) => (
+                    <div
+                      key={req.id}
+                      className="flex items-center justify-between text-sm px-3 py-2 bg-gray-50 rounded"
+                    >
+                      <div>
+                        <span className="font-medium text-gray-700">
+                          {req.display_name || req.email}
+                        </span>
+                        <span className="text-xs text-gray-400 ml-2">
+                          {new Date(req.created_at).toLocaleString()}
+                        </span>
+                      </div>
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded font-medium ${
+                          req.status === "approved"
+                            ? "bg-green-100 text-green-700"
+                            : "bg-gray-200 text-gray-600"
+                        }`}
+                      >
+                        {req.status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* Role quotas */}
       <div className="space-y-4">

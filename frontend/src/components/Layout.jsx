@@ -5,20 +5,25 @@ import {
   GitBranch, LayoutDashboard, Gauge, AlertTriangle
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import { getUnresolvedAlertCount } from "../services/api";
+import { getUnresolvedAlertCount, getPendingQuotaRequestCount } from "../services/api";
 
 export default function Layout() {
   const { firebaseUser, isAdmin, isSuperUser, signOut } = useAuth();
   const navigate = useNavigate();
   const [alertCount, setAlertCount] = useState(0);
+  const [quotaRequestCount, setQuotaRequestCount] = useState(0);
 
-  // Fetch unresolved alert count for admin badge
+  // Fetch unresolved alert count + pending quota requests for admin badges
   useEffect(() => {
     if (!isAdmin) return;
     const fetch = async () => {
       try {
-        const data = await getUnresolvedAlertCount();
-        setAlertCount(data.count || 0);
+        const [alerts, quotas] = await Promise.all([
+          getUnresolvedAlertCount().catch(() => ({ count: 0 })),
+          getPendingQuotaRequestCount().catch(() => ({ count: 0 })),
+        ]);
+        setAlertCount(alerts.count || 0);
+        setQuotaRequestCount(quotas.count || 0);
       } catch {}
     };
     fetch();
@@ -94,6 +99,11 @@ export default function Layout() {
                   <NavLink to="/admin/quotas" className={linkClass}>
                     <Gauge className="w-4 h-4" />
                     <span className="hidden md:inline">Quotas</span>
+                    {quotaRequestCount > 0 && (
+                      <span className="ml-1 px-1.5 py-0.5 text-[10px] font-bold bg-amber-400 text-amber-900 rounded-full leading-none">
+                        {quotaRequestCount}
+                      </span>
+                    )}
                   </NavLink>
                 </>
               )}

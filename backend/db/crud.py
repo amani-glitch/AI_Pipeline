@@ -502,6 +502,96 @@ def delete_quota(db: FirestoreClient, target_type: str, target_id: str) -> None:
     db.collection(_QUOTAS).document(doc_id).delete()
 
 
+_QUOTA_REQUESTS = "quota_requests"
+
+
+def create_quota_request(
+    db: FirestoreClient,
+    *,
+    uid: str,
+    email: str,
+    display_name: str,
+    role: str,
+    current_quota: dict,
+    requested_quota: dict,
+    reason: str = "",
+) -> SimpleNamespace:
+    """Create a quota-increase request (pending admin review)."""
+    data = {
+        "uid": uid,
+        "email": email,
+        "display_name": display_name,
+        "role": role,
+        "current_quota": current_quota,
+        "requested_quota": requested_quota,
+        "reason": reason,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+        "reviewed_at": None,
+        "reviewed_by": None,
+        "admin_note": None,
+    }
+    _, doc_ref = db.collection(_QUOTA_REQUESTS).add(data)
+    data["id"] = doc_ref.id
+    return SimpleNamespace(**data)
+
+
+def list_quota_requests(
+    db: FirestoreClient,
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> list[SimpleNamespace]:
+    """List quota requests, optionally filtered by status."""
+    if status is not None:
+        query = db.collection(_QUOTA_REQUESTS).where("status", "==", status)
+    else:
+        query = db.collection(_QUOTA_REQUESTS)
+    results = [_doc_to_record(doc) for doc in query.stream()]
+    results.sort(key=lambda r: getattr(r, "created_at", None) or datetime.min, reverse=True)
+    return results[:limit]
+
+
+def get_quota_request(db: FirestoreClient, request_id: str) -> Optional[SimpleNamespace]:
+    doc = db.collection(_QUOTA_REQUESTS).document(request_id).get()
+    if not doc.exists:
+        return None
+    return _doc_to_record(doc)
+
+
+def update_quota_request_status(
+    db: FirestoreClient,
+    request_id: str,
+    *,
+    status: str,
+    reviewed_by: str,
+    admin_note: str = "",
+) -> None:
+    db.collection(_QUOTA_REQUESTS).document(request_id).update({
+        "status": status,
+        "reviewed_at": datetime.now(timezone.utc),
+        "reviewed_by": reviewed_by,
+        "admin_note": admin_note,
+    })
+
+
+def count_pending_quota_requests(db: FirestoreClient) -> int:
+    query = db.collection(_QUOTA_REQUESTS).where("status", "==", "pending")
+    return len(list(query.stream()))
+
+
+def list_admin_emails(db: FirestoreClient) -> list[str]:
+    """Return the email addresses of all approved admin users."""
+    query = db.collection(_USERS).where("role", "==", "admin")
+    emails: list[str] = []
+    for doc in query.stream():
+        data = doc.to_dict() or {}
+        if data.get("status") == UserStatus.APPROVED.value:
+            email = data.get("email")
+            if email:
+                emails.append(email)
+    return emails
+
+
 def get_user_quota_usage(db: FirestoreClient, uid: str, email: str) -> dict:
     """Get current deployment usage for a user.
 

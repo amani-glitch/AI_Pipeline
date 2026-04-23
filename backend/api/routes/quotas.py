@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
+from config import Settings, get_settings
 from db.database import get_db
 from db import crud
 from api.dependencies import require_admin, require_approved
@@ -79,12 +81,33 @@ _DEFAULT_QUOTAS = {
 #  GET /api/quotas/defaults — get default quotas per role
 # ═══════════════════════════════════════════════════════════════════════
 
+def _effective_role_quota(db, role: str) -> QuotaConfig:
+    """Return the stored quota for a role, falling back to defaults."""
+    stored = crud.get_quota(db, target_type="role", target_id=role)
+    if stored:
+        return QuotaConfig(**stored)
+    return _DEFAULT_QUOTAS.get(role, QuotaConfig())
+
+
+def _effective_user_quota(db, uid: str, role: str) -> QuotaConfig:
+    """Return the effective quota for a user — override wins over role."""
+    stored_user = crud.get_quota(db, target_type="user", target_id=uid)
+    if stored_user:
+        return QuotaConfig(**stored_user)
+    return _effective_role_quota(db, role)
+
+
 @router.get("/defaults")
-def get_defaults(user=Depends(require_admin)):
-    """Return default quota configs per role (admin only)."""
+def get_defaults(user=Depends(require_admin), db=Depends(get_db)):
+    """Return the effective quota config per role (admin only).
+
+    This reads the stored value from Firestore when present, falling back to
+    the built-in defaults. That way the admin UI always reflects the current
+    value and saved changes persist across reloads.
+    """
     return {
-        role: config.model_dump()
-        for role, config in _DEFAULT_QUOTAS.items()
+        role: _effective_role_quota(db, role).model_dump()
+        for role in _DEFAULT_QUOTAS.keys()
     }
 
 
@@ -95,12 +118,7 @@ def get_defaults(user=Depends(require_admin)):
 @router.get("/role/{role}", response_model=QuotaResponse)
 def get_role_quota(role: str, user=Depends(require_admin), db=Depends(get_db)):
     """Get the quota config for a role."""
-    stored = crud.get_quota(db, target_type="role", target_id=role)
-    if stored:
-        config = QuotaConfig(**stored)
-    else:
-        config = _DEFAULT_QUOTAS.get(role, QuotaConfig())
-
+    config = _effective_role_quota(db, role)
     role_labels = {"simple_user": "Utilisateur Simple", "super_user": "Super Utilisateur", "admin": "Administrateur"}
     return QuotaResponse(
         target_type="role",
@@ -127,8 +145,7 @@ def set_role_quota(
         raise HTTPException(status_code=400, detail=f"Invalid role: {role}")
 
     # Get current config as base
-    stored = crud.get_quota(db, target_type="role", target_id=role)
-    base = QuotaConfig(**(stored or _DEFAULT_QUOTAS.get(role, QuotaConfig()).model_dump()))
+    base = _effective_role_quota(db, role)
 
     # Merge updates
     updates = body.model_dump(exclude_none=True)
@@ -157,16 +174,8 @@ def get_user_quota(uid: str, user=Depends(require_admin), db=Depends(get_db)):
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    # Check for user-specific override
-    stored = crud.get_quota(db, target_type="user", target_id=uid)
-    if stored:
-        config = QuotaConfig(**stored)
-    else:
-        # Fall back to role quota
-        role = getattr(target_user, "role", "simple_user") or "simple_user"
-        role_stored = crud.get_quota(db, target_type="role", target_id=role)
-        config = QuotaConfig(**(role_stored or _DEFAULT_QUOTAS.get(role, QuotaConfig()).model_dump()))
-
+    role = getattr(target_user, "role", "simple_user") or "simple_user"
+    config = _effective_user_quota(db, uid, role)
     return QuotaResponse(
         target_type="user",
         target_id=uid,
@@ -192,13 +201,8 @@ def set_user_quota(
         raise HTTPException(status_code=404, detail="User not found.")
 
     # Get base config (user override or role default)
-    stored = crud.get_quota(db, target_type="user", target_id=uid)
-    if stored:
-        base = QuotaConfig(**stored)
-    else:
-        role = getattr(target_user, "role", "simple_user") or "simple_user"
-        role_stored = crud.get_quota(db, target_type="role", target_id=role)
-        base = QuotaConfig(**(role_stored or _DEFAULT_QUOTAS.get(role, QuotaConfig()).model_dump()))
+    role = getattr(target_user, "role", "simple_user") or "simple_user"
+    base = _effective_user_quota(db, uid, role)
 
     updates = body.model_dump(exclude_none=True)
     merged = base.model_dump()
@@ -234,14 +238,8 @@ def get_my_usage(user=Depends(require_approved), db=Depends(get_db)):
     """Get the current user's quota usage and limits."""
     usage = crud.get_user_quota_usage(db, user.uid, getattr(user, "email", ""))
 
-    # Resolve effective quota
-    stored_user = crud.get_quota(db, target_type="user", target_id=user.uid)
-    if stored_user:
-        quota = QuotaConfig(**stored_user)
-    else:
-        role = getattr(user, "role", "simple_user") or "simple_user"
-        stored_role = crud.get_quota(db, target_type="role", target_id=role)
-        quota = QuotaConfig(**(stored_role or _DEFAULT_QUOTAS.get(role, QuotaConfig()).model_dump()))
+    role = getattr(user, "role", "simple_user") or "simple_user"
+    quota = _effective_user_quota(db, user.uid, role)
 
     within_limits = True
     if quota.max_deployments_per_day >= 0 and usage["deployments_today"] >= quota.max_deployments_per_day:
@@ -267,14 +265,8 @@ def get_my_usage(user=Depends(require_approved), db=Depends(get_db)):
 def check_quota(db, user) -> None:
     """Raise 429 if the user has exceeded their quota. Call before creating deployment."""
     usage = crud.get_user_quota_usage(db, user.uid, getattr(user, "email", ""))
-
-    stored_user = crud.get_quota(db, target_type="user", target_id=user.uid)
-    if stored_user:
-        quota = QuotaConfig(**stored_user)
-    else:
-        role = getattr(user, "role", "simple_user") or "simple_user"
-        stored_role = crud.get_quota(db, target_type="role", target_id=role)
-        quota = QuotaConfig(**(stored_role or _DEFAULT_QUOTAS.get(role, QuotaConfig()).model_dump()))
+    role = getattr(user, "role", "simple_user") or "simple_user"
+    quota = _effective_user_quota(db, user.uid, role)
 
     if quota.max_deployments_per_day >= 0 and usage["deployments_today"] >= quota.max_deployments_per_day:
         raise HTTPException(
@@ -291,3 +283,210 @@ def check_quota(db, user) -> None:
             status_code=429,
             detail=f"Quota exceeded: maximum {quota.max_total_deployments} total deployments.",
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Quota increase requests (user asks admin for more)
+# ═══════════════════════════════════════════════════════════════════════
+
+class QuotaIncreaseRequestBody(BaseModel):
+    """Payload for POST /api/quotas/request-increase."""
+    requested_quota: QuotaUpdate
+    reason: str = ""
+
+
+class QuotaRequestResponse(BaseModel):
+    id: str
+    uid: str
+    email: str
+    display_name: str
+    role: str
+    current_quota: QuotaConfig
+    requested_quota: QuotaConfig
+    reason: str = ""
+    status: str  # pending | approved | rejected
+    created_at: Optional[datetime] = None
+    reviewed_at: Optional[datetime] = None
+    reviewed_by: Optional[str] = None
+    admin_note: Optional[str] = None
+
+
+class QuotaRequestReview(BaseModel):
+    """Admin payload when approving/rejecting a request.
+
+    For approvals, ``applied_quota`` overrides what actually gets stored —
+    letting the admin grant a different amount than the user asked for.
+    """
+    applied_quota: Optional[QuotaUpdate] = None
+    admin_note: str = ""
+
+
+def _request_to_response(req) -> QuotaRequestResponse:
+    return QuotaRequestResponse(
+        id=req.id,
+        uid=getattr(req, "uid", ""),
+        email=getattr(req, "email", ""),
+        display_name=getattr(req, "display_name", ""),
+        role=getattr(req, "role", "simple_user"),
+        current_quota=QuotaConfig(**(getattr(req, "current_quota", {}) or {})),
+        requested_quota=QuotaConfig(**(getattr(req, "requested_quota", {}) or {})),
+        reason=getattr(req, "reason", "") or "",
+        status=getattr(req, "status", "pending"),
+        created_at=getattr(req, "created_at", None),
+        reviewed_at=getattr(req, "reviewed_at", None),
+        reviewed_by=getattr(req, "reviewed_by", None),
+        admin_note=getattr(req, "admin_note", None),
+    )
+
+
+@router.post("/request-increase", response_model=QuotaRequestResponse, status_code=201)
+async def request_quota_increase(
+    body: QuotaIncreaseRequestBody,
+    user=Depends(require_approved),
+    db=Depends(get_db),
+    settings: Settings = Depends(get_settings),
+):
+    """A user asks for a higher quota. Notifies admins via email + alert."""
+    role = getattr(user, "role", "simple_user") or "simple_user"
+    current = _effective_user_quota(db, user.uid, role).model_dump()
+
+    # Merge requested values on top of current so the payload always reflects
+    # a full target config (unset fields keep the current value).
+    updates = body.requested_quota.model_dump(exclude_none=True)
+    merged_target = {**current, **updates}
+
+    # Reject no-op requests
+    if all(merged_target.get(k) == current.get(k) for k in current.keys()):
+        raise HTTPException(
+            status_code=400,
+            detail="Requested quota must differ from your current quota.",
+        )
+
+    display_name = getattr(user, "display_name", "") or getattr(user, "email", "")
+    email = getattr(user, "email", "")
+
+    req = crud.create_quota_request(
+        db,
+        uid=user.uid,
+        email=email,
+        display_name=display_name,
+        role=role,
+        current_quota=current,
+        requested_quota=merged_target,
+        reason=body.reason.strip(),
+    )
+
+    # Create an in-platform alert so admins see the request on the dashboard
+    try:
+        crud.create_alert(
+            db,
+            severity="info",
+            source="quota_request",
+            title=f"Demande de quota: {display_name}",
+            message=(
+                f"{display_name} ({email}) demande une augmentation de quota."
+                + (f" Motif: {body.reason.strip()}" if body.reason.strip() else "")
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to create alert for quota request %s", req.id)
+
+    # Email admins (collection of approved admin users, plus the configured
+    # ADMIN_APPROVAL_EMAIL fallback)
+    try:
+        admin_emails = crud.list_admin_emails(db)
+        if settings.ADMIN_APPROVAL_EMAIL and settings.ADMIN_APPROVAL_EMAIL not in admin_emails:
+            admin_emails.append(settings.ADMIN_APPROVAL_EMAIL)
+
+        from services.email_service import EmailService
+        email_svc = EmailService(settings=settings)
+        await email_svc.send_quota_increase_request(
+            admin_emails=admin_emails,
+            display_name=display_name,
+            user_email=email,
+            role=role,
+            current_quota=current,
+            requested_quota=merged_target,
+            reason=body.reason.strip(),
+            admin_url=f"{settings.FRONTEND_URL}/admin/quotas",
+        )
+    except Exception:
+        logger.exception("Failed to email admins about quota request %s", req.id)
+
+    return _request_to_response(req)
+
+
+@router.get("/requests", response_model=list[QuotaRequestResponse])
+def list_quota_requests(
+    status: Optional[str] = None,
+    limit: int = 100,
+    user=Depends(require_admin),
+    db=Depends(get_db),
+):
+    """List quota-increase requests (admin only)."""
+    items = crud.list_quota_requests(db, status=status, limit=limit)
+    return [_request_to_response(i) for i in items]
+
+
+@router.get("/requests/pending-count")
+def pending_quota_requests_count(user=Depends(require_admin), db=Depends(get_db)):
+    """Badge count for pending quota requests."""
+    return {"count": crud.count_pending_quota_requests(db)}
+
+
+@router.post("/requests/{request_id}/approve", response_model=QuotaRequestResponse)
+def approve_quota_request(
+    request_id: str,
+    body: Optional[QuotaRequestReview] = None,
+    user=Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Approve a quota-increase request and apply the limits as a user override."""
+    req = crud.get_quota_request(db, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if getattr(req, "status", "pending") != "pending":
+        raise HTTPException(status_code=400, detail="Request has already been reviewed.")
+
+    # Resolve the final limits: admin override > originally requested
+    final = dict(getattr(req, "requested_quota", {}) or {})
+    if body and body.applied_quota:
+        for k, v in body.applied_quota.model_dump(exclude_none=True).items():
+            final[k] = v
+
+    crud.set_quota(db, target_type="user", target_id=req.uid, config=final)
+    crud.update_quota_request_status(
+        db,
+        request_id,
+        status="approved",
+        reviewed_by=getattr(user, "email", "admin"),
+        admin_note=(body.admin_note if body else "") or "",
+    )
+
+    updated = crud.get_quota_request(db, request_id)
+    return _request_to_response(updated)
+
+
+@router.post("/requests/{request_id}/reject", response_model=QuotaRequestResponse)
+def reject_quota_request(
+    request_id: str,
+    body: Optional[QuotaRequestReview] = None,
+    user=Depends(require_admin),
+    db=Depends(get_db),
+):
+    """Reject a quota-increase request."""
+    req = crud.get_quota_request(db, request_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found.")
+    if getattr(req, "status", "pending") != "pending":
+        raise HTTPException(status_code=400, detail="Request has already been reviewed.")
+
+    crud.update_quota_request_status(
+        db,
+        request_id,
+        status="rejected",
+        reviewed_by=getattr(user, "email", "admin"),
+        admin_note=(body.admin_note if body else "") or "",
+    )
+    updated = crud.get_quota_request(db, request_id)
+    return _request_to_response(updated)
