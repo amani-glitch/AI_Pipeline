@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ExternalLink,
@@ -7,8 +7,16 @@ import {
   RefreshCw,
   Loader,
   Trash2,
+  CalendarRange,
+  X,
+  AlertTriangle,
+  CheckCircle2,
 } from "lucide-react";
-import { getDeployments, deleteDeployment } from "../services/api";
+import {
+  getDeployments,
+  deleteDeployment,
+  bulkDeleteDeployments,
+} from "../services/api";
 
 const STATUS_BADGE = {
   queued: "bg-gray-100 text-gray-700 ring-gray-300",
@@ -21,42 +29,345 @@ const MODE_BADGE = {
   demo: "bg-purple-100 text-purple-700 ring-purple-300",
   prod: "bg-orange-100 text-orange-700 ring-orange-300",
   cloudrun: "bg-teal-100 text-teal-700 ring-teal-300",
+  subdomain: "bg-sky-100 text-sky-700 ring-sky-300",
 };
 
 const MODE_LABELS = {
   demo: "Demo",
   prod: "Prod",
   cloudrun: "Cloud Run",
+  subdomain: "Subdomain",
 };
 
+const MODE_OPTIONS = ["demo", "cloudrun", "subdomain", "prod"];
+
+/** Mirrors the server's _DELETABLE_STATUSES — in-flight runs are never swept. */
+const DELETABLE = new Set(["success", "failed"]);
+
+/** Above this many, deleting requires typing the word out. */
+const TYPE_TO_CONFIRM_ABOVE = 10;
+
+/** Local calendar day as YYYY-MM-DD (not UTC — avoids an off-by-one evening shift). */
+function isoDay(date) {
+  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return shifted.toISOString().slice(0, 10);
+}
+
+/** Range covering the last `days` days, today included. */
+function lastDays(days) {
+  const today = new Date();
+  const start = new Date();
+  start.setDate(start.getDate() - (days - 1));
+  return { from: isoDay(start), to: isoDay(today) };
+}
+
+const PRESETS = [
+  { label: "All time", range: () => ({ from: "", to: "" }) },
+  { label: "Last 7 days", range: () => lastDays(7) },
+  { label: "Last 30 days", range: () => lastDays(30) },
+  { label: "Last 90 days", range: () => lastDays(90) },
+];
+
+function errorText(err, fallback) {
+  return err.response?.data?.detail || err.message || fallback;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Bulk delete dialog — previews first, then executes against that preview
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function BulkDeleteDialog({ request, onClose, onCompleted }) {
+  const [preview, setPreview] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(true);
+  const [confirmText, setConfirmText] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setBusy(true);
+    setError(null);
+    bulkDeleteDeployments({ ...request.payload, dryRun: true })
+      .then((data) => !cancelled && setPreview(data))
+      .catch((err) => !cancelled && setError(errorText(err, "Preview failed")))
+      .finally(() => !cancelled && setBusy(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [request]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [busy, onClose]);
+
+  const matched = preview?.matched ?? 0;
+  const needsTyping = matched > TYPE_TO_CONFIRM_ABOVE;
+  const canRun =
+    !busy && !result && matched > 0 && (!needsTyping || confirmText === "DELETE");
+
+  const byMode = useMemo(() => {
+    const counts = {};
+    (preview?.items || []).forEach((i) => {
+      counts[i.mode] = (counts[i.mode] || 0) + 1;
+    });
+    return counts;
+  }, [preview]);
+
+  const execute = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const data = await bulkDeleteDeployments({
+        ...request.payload,
+        dryRun: false,
+        expectedCount: matched,
+      });
+      setResult(data);
+      onCompleted(data);
+    } catch (err) {
+      setError(errorText(err, "Bulk delete failed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={() => !busy && onClose()}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bulk-delete-title"
+        onClick={(e) => e.stopPropagation()}
+        className="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+      >
+        <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-gray-200">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 p-2 rounded-lg bg-red-50">
+              <Trash2 className="w-5 h-5 text-red-600" />
+            </div>
+            <div>
+              <h2 id="bulk-delete-title" className="text-lg font-semibold text-gray-900">
+                {result ? "Deletion finished" : "Delete deployments"}
+              </h2>
+              <p className="text-sm text-gray-500">{request.description}</p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            disabled={busy}
+            className="text-gray-400 hover:text-gray-600 disabled:opacity-40
+              disabled:cursor-not-allowed transition-colors"
+            aria-label="Close"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="px-6 py-4 overflow-y-auto grow">
+          {busy && !preview && (
+            <div className="flex items-center justify-center py-12">
+              <Loader className="w-7 h-7 text-[#2563EB] animate-spin" />
+            </div>
+          )}
+
+          {error && (
+            <div className="px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-sm text-red-700">
+              {error}
+            </div>
+          )}
+
+          {/* ── Outcome ─────────────────────────────────────────────── */}
+          {result && (
+            <div className="flex flex-col gap-3">
+              <div
+                className={`flex items-center gap-2 px-4 py-3 rounded-lg border text-sm ${
+                  result.failed_count
+                    ? "bg-amber-50 border-amber-200 text-amber-800"
+                    : "bg-green-50 border-green-200 text-green-800"
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                {result.deleted_count} deleted
+                {result.failed_count > 0 && `, ${result.failed_count} failed`}.
+              </div>
+              {result.items.filter((i) => i.error).length > 0 && (
+                <ul className="text-xs text-gray-600 flex flex-col gap-1 max-h-48 overflow-y-auto">
+                  {result.items
+                    .filter((i) => i.error)
+                    .map((i) => (
+                      <li key={i.id} className="flex gap-2">
+                        <span className="font-medium text-gray-800">{i.website_name}</span>
+                        <span className="text-red-600">{i.error}</span>
+                      </li>
+                    ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {/* ── Preview ─────────────────────────────────────────────── */}
+          {preview && !result && !error && (
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-gray-700">
+                <span className="font-semibold text-gray-900">{matched}</span> deployment
+                {matched !== 1 ? "s" : ""} will be permanently deleted, along with their
+                GCP resources. This cannot be undone.
+              </p>
+
+              {Object.keys(byMode).length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(byMode).map(([mode, count]) => (
+                    <span
+                      key={mode}
+                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs
+                        font-medium ring-1 ring-inset ${MODE_BADGE[mode] || MODE_BADGE.demo}`}
+                    >
+                      {MODE_LABELS[mode] || mode}: {count}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {preview.warnings?.map((w) => (
+                <div
+                  key={w}
+                  className="flex items-start gap-2 px-4 py-3 rounded-lg bg-amber-50
+                    border border-amber-200 text-sm text-amber-800"
+                >
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  {w}
+                </div>
+              ))}
+
+              {matched > 0 && (
+                <div className="border border-gray-200 rounded-lg max-h-56 overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <tbody className="divide-y divide-gray-100">
+                      {preview.items.map((i) => (
+                        <tr key={i.id}>
+                          <td className="px-3 py-1.5 font-medium text-gray-800">
+                            {i.website_name}
+                          </td>
+                          <td className="px-3 py-1.5 text-gray-500">
+                            {MODE_LABELS[i.mode] || i.mode}
+                          </td>
+                          <td className="px-3 py-1.5 text-gray-500">{i.status}</td>
+                          <td className="px-3 py-1.5 text-gray-400 whitespace-nowrap">
+                            {i.created_at ? new Date(i.created_at).toLocaleDateString() : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {needsTyping && (
+                <label className="text-sm text-gray-700 flex flex-col gap-1.5">
+                  Type <span className="font-mono font-semibold">DELETE</span> to confirm
+                  <input
+                    type="text"
+                    value={confirmText}
+                    onChange={(e) => setConfirmText(e.target.value)}
+                    autoComplete="off"
+                    className="px-3 py-2 border border-gray-200 rounded-lg text-sm
+                      focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent"
+                  />
+                </label>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200">
+          <button
+            onClick={onClose}
+            disabled={busy}
+            className="px-4 py-2 rounded-lg text-sm font-medium text-gray-700 bg-white
+              border border-gray-200 hover:bg-gray-50 disabled:opacity-40
+              disabled:cursor-not-allowed transition-colors"
+          >
+            {result ? "Close" : "Cancel"}
+          </button>
+          {!result && (
+            <button
+              onClick={execute}
+              disabled={!canRun}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm
+                font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-40
+                disabled:cursor-not-allowed transition-colors"
+            >
+              {busy && preview ? (
+                <Loader className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+              Delete {matched > 0 ? matched : ""}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   History table
+   ═══════════════════════════════════════════════════════════════════════ */
+
 /**
- * Deployment history table with sortable date column, status/mode badges,
- * delete buttons, and clickable rows.
+ * Deployment history table with date-range and mode filters, row selection,
+ * single and bulk delete, a sortable date column, and clickable rows.
  */
 export default function DeploymentHistory() {
   const navigate = useNavigate();
   const [deployments, setDeployments] = useState([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [sortAsc, setSortAsc] = useState(false); // default newest first
   const [deleting, setDeleting] = useState({}); // { [id]: true } while deleting
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [modes, setModes] = useState([]); // empty = every mode
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkRequest, setBulkRequest] = useState(null);
 
-  const fetchData = async () => {
+  const modesKey = modes.join(",");
+
+  const fetchData = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await getDeployments();
-      setDeployments(Array.isArray(data) ? data : data.deployments || []);
+      const { deployments: rows, total: matching } = await getDeployments({
+        startDate: fromDate,
+        endDate: toDate,
+        modes: modesKey ? modesKey.split(",") : [],
+      });
+      setDeployments(rows);
+      setTotal(matching);
+      // Drop selections that fell out of the new result set
+      setSelected((prev) => {
+        const ids = new Set(rows.map((r) => r.id));
+        return new Set([...prev].filter((id) => ids.has(id)));
+      });
     } catch (err) {
-      setError(err.response?.data?.detail || err.message || "Failed to load deployments");
+      setError(errorText(err, "Failed to load deployments"));
     } finally {
       setLoading(false);
     }
-  };
+  }, [fromDate, toDate, modesKey]);
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [fetchData]);
 
   const handleDelete = async (e, dep) => {
     e.stopPropagation();
@@ -77,10 +388,9 @@ export default function DeploymentHistory() {
       }
       // Remove from local state
       setDeployments((prev) => prev.filter((d) => d.id !== dep.id));
+      setTotal((prev) => Math.max(0, prev - 1));
     } catch (err) {
-      alert(
-        `Failed to delete: ${err.response?.data?.detail || err.message || "Unknown error"}`
-      );
+      alert(`Failed to delete: ${errorText(err, "Unknown error")}`);
     } finally {
       setDeleting((prev) => ({ ...prev, [dep.id]: false }));
     }
@@ -101,29 +411,92 @@ export default function DeploymentHistory() {
     return new Date(dateStr).toLocaleString();
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-24">
-        <Loader className="w-8 h-8 text-[#2563EB] animate-spin" />
-      </div>
-    );
-  }
+  const filtered = Boolean(fromDate || toDate || modes.length);
+  const truncated = total > deployments.length;
 
-  if (error) {
-    return (
-      <div className="max-w-2xl mx-auto text-center py-16">
-        <p className="text-red-600 font-medium mb-4">{error}</p>
-        <button
-          onClick={fetchData}
-          className="inline-flex items-center gap-2 px-4 py-2 bg-[#2563EB] text-white
-            rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
-        >
-          <RefreshCw className="w-4 h-4" />
-          Retry
-        </button>
-      </div>
+  const selectableIds = useMemo(
+    () => sorted.filter((d) => DELETABLE.has(d.status)).map((d) => d.id),
+    [sorted]
+  );
+  const allSelected =
+    selectableIds.length > 0 && selectableIds.every((id) => selected.has(id));
+  const someSelected = selected.size > 0 && !allSelected;
+
+  const headerCheckbox = useRef(null);
+  useEffect(() => {
+    if (headerCheckbox.current) headerCheckbox.current.indeterminate = someSelected;
+  }, [someSelected]);
+
+  const toggleAll = () => {
+    setSelected(allSelected ? new Set() : new Set(selectableIds));
+  };
+
+  const toggleOne = (id) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const applyPreset = (preset) => {
+    const { from, to } = preset.range();
+    setFromDate(from);
+    setToDate(to);
+  };
+
+  const isActivePreset = (preset) => {
+    const { from, to } = preset.range();
+    return from === fromDate && to === toDate;
+  };
+
+  const toggleMode = (mode) => {
+    setModes((prev) =>
+      prev.includes(mode) ? prev.filter((m) => m !== mode) : [...prev, mode]
     );
-  }
+  };
+
+  const clearFilters = () => {
+    setFromDate("");
+    setToDate("");
+    setModes([]);
+  };
+
+  // Keep the two inputs from crossing over
+  const handleFrom = (value) => {
+    setFromDate(value);
+    if (value && toDate && value > toDate) setToDate(value);
+  };
+
+  const handleTo = (value) => {
+    setToDate(value);
+    if (value && fromDate && value < fromDate) setFromDate(value);
+  };
+
+  const rangeLabel = `${fromDate || "the start"} → ${toDate || "today"}`;
+
+  const deleteSelected = () =>
+    setBulkRequest({
+      description: `${selected.size} hand-picked deployment${
+        selected.size !== 1 ? "s" : ""
+      }`,
+      payload: { ids: [...selected], includeProd: true },
+    });
+
+  const deleteMatching = () =>
+    setBulkRequest({
+      description: [
+        modes.length ? modes.map((m) => MODE_LABELS[m] || m).join(" + ") : "All modes",
+        fromDate || toDate ? rangeLabel : "all time",
+      ].join(" · "),
+      payload: {
+        startDate: fromDate,
+        endDate: toDate,
+        modes,
+        includeProd: modes.includes("prod"),
+      },
+    });
 
   return (
     <div>
@@ -131,7 +504,12 @@ export default function DeploymentHistory() {
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Deployment History</h1>
           <p className="mt-1 text-gray-600">
-            {deployments.length} deployment{deployments.length !== 1 ? "s" : ""}
+            {loading
+              ? "Loading…"
+              : `${deployments.length} of ${total} deployment${total !== 1 ? "s" : ""}`}
+            {filtered && !loading && (
+              <span className="text-gray-400"> · {rangeLabel}</span>
+            )}
           </p>
         </div>
         <button
@@ -139,18 +517,193 @@ export default function DeploymentHistory() {
           className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-gray-200
             rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
         >
-          <RefreshCw className="w-4 h-4" />
+          <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
           Refresh
         </button>
       </div>
 
-      {sorted.length === 0 ? (
+      {/* ── Filters ───────────────────────────────────────────────────── */}
+      <div
+        className="bg-white rounded-xl border border-gray-200 px-4 py-3 mb-4
+          flex flex-wrap items-center gap-x-4 gap-y-3"
+      >
+        <span className="inline-flex items-center gap-2 text-sm font-medium text-gray-700">
+          <CalendarRange className="w-4 h-4 text-gray-400" />
+          Date range
+        </span>
+
+        <div className="flex items-center gap-2">
+          <label htmlFor="from-date" className="text-sm text-gray-500">
+            From
+          </label>
+          <input
+            id="from-date"
+            type="date"
+            value={fromDate}
+            max={toDate || undefined}
+            onChange={(e) => handleFrom(e.target.value)}
+            className="px-2.5 py-1.5 border border-gray-200 rounded-lg text-sm text-gray-700
+              focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:border-transparent"
+          />
+          <label htmlFor="to-date" className="text-sm text-gray-500">
+            To
+          </label>
+          <input
+            id="to-date"
+            type="date"
+            value={toDate}
+            min={fromDate || undefined}
+            onChange={(e) => handleTo(e.target.value)}
+            className="px-2.5 py-1.5 border border-gray-200 rounded-lg text-sm text-gray-700
+              focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:border-transparent"
+          />
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          {PRESETS.map((preset) => (
+            <button
+              key={preset.label}
+              onClick={() => applyPreset(preset)}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors
+                ${
+                  isActivePreset(preset)
+                    ? "bg-[#2563EB] text-white"
+                    : "bg-gray-50 text-gray-600 hover:bg-gray-100"
+                }`}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 border-l border-gray-200 pl-4">
+          <span className="text-sm font-medium text-gray-700">Mode</span>
+          {MODE_OPTIONS.map((mode) => (
+            <button
+              key={mode}
+              onClick={() => toggleMode(mode)}
+              aria-pressed={modes.includes(mode)}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors
+                ${
+                  modes.includes(mode)
+                    ? "bg-[#2563EB] text-white"
+                    : "bg-gray-50 text-gray-600 hover:bg-gray-100"
+                }`}
+            >
+              {MODE_LABELS[mode]}
+            </button>
+          ))}
+        </div>
+
+        {filtered && (
+          <button
+            onClick={clearFilters}
+            className="inline-flex items-center gap-1 text-xs font-medium text-gray-500
+              hover:text-gray-700 transition-colors"
+          >
+            <X className="w-3.5 h-3.5" />
+            Clear
+          </button>
+        )}
+      </div>
+
+      {/* ── Bulk actions ──────────────────────────────────────────────── */}
+      {!loading && !error && sorted.length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-3 mb-4 px-4 py-3 rounded-xl
+            border border-gray-200 bg-white"
+        >
+          <span className="text-sm text-gray-600">
+            {selected.size > 0
+              ? `${selected.size} selected`
+              : "Select rows, or delete everything matching the filters"}
+          </span>
+
+          <div className="flex items-center gap-2 ml-auto">
+            {selected.size > 0 && (
+              <>
+                <button
+                  onClick={() => setSelected(new Set())}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600
+                    bg-gray-50 hover:bg-gray-100 transition-colors"
+                >
+                  Clear selection
+                </button>
+                <button
+                  onClick={deleteSelected}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs
+                    font-medium text-white bg-red-600 hover:bg-red-700 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete {selected.size} selected
+                </button>
+              </>
+            )}
+            <button
+              onClick={deleteMatching}
+              disabled={!filtered}
+              title={
+                filtered
+                  ? undefined
+                  : "Set a date range or a mode first — deleting everything at once is not allowed"
+              }
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs
+                font-medium text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-40
+                disabled:cursor-not-allowed transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete all matching
+            </button>
+          </div>
+        </div>
+      )}
+
+      {truncated && !loading && (
+        <div
+          className="mb-4 px-4 py-3 rounded-lg bg-amber-50 border border-amber-200
+            text-sm text-amber-800"
+        >
+          Showing the {deployments.length} most recent of {total} matching
+          deployments. Narrow the date range to see the older ones.
+        </div>
+      )}
+
+      {/* ── Results ───────────────────────────────────────────────────── */}
+      {error ? (
+        <div className="max-w-2xl mx-auto text-center py-16">
+          <p className="text-red-600 font-medium mb-4">{error}</p>
+          <button
+            onClick={fetchData}
+            className="inline-flex items-center gap-2 px-4 py-2 bg-[#2563EB] text-white
+              rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Retry
+          </button>
+        </div>
+      ) : loading ? (
+        <div className="flex items-center justify-center py-24">
+          <Loader className="w-8 h-8 text-[#2563EB] animate-spin" />
+        </div>
+      ) : sorted.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-24 text-gray-400">
           <Inbox className="w-16 h-16 mb-4" />
-          <p className="text-lg font-medium text-gray-500">No deployments yet</p>
-          <p className="text-sm text-gray-400 mt-1">
-            Deploy your first website to see it here.
+          <p className="text-lg font-medium text-gray-500">
+            {filtered ? "No deployments match these filters" : "No deployments yet"}
           </p>
+          {filtered ? (
+            <button
+              onClick={clearFilters}
+              className="mt-3 text-sm font-medium text-[#2563EB] hover:text-blue-700
+                transition-colors"
+            >
+              Show all deployments
+            </button>
+          ) : (
+            <p className="text-sm text-gray-400 mt-1">
+              Deploy your first website to see it here.
+            </p>
+          )}
         </div>
       ) : (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -158,6 +711,17 @@ export default function DeploymentHistory() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-gray-50 border-b border-gray-200">
+                  <th className="px-4 py-3 w-10">
+                    <input
+                      ref={headerCheckbox}
+                      type="checkbox"
+                      checked={allSelected}
+                      onChange={toggleAll}
+                      disabled={selectableIds.length === 0}
+                      aria-label="Select all deletable deployments"
+                      className="w-4 h-4 accent-[#2563EB] cursor-pointer disabled:cursor-not-allowed"
+                    />
+                  </th>
                   <th className="px-6 py-3 text-left font-semibold text-gray-600">
                     Website Name
                   </th>
@@ -190,8 +754,21 @@ export default function DeploymentHistory() {
                   <tr
                     key={dep.id}
                     onClick={() => navigate(`/deployments/${dep.id}`)}
-                    className="hover:bg-gray-50 cursor-pointer transition-colors"
+                    className={`hover:bg-gray-50 cursor-pointer transition-colors ${
+                      selected.has(dep.id) ? "bg-blue-50/60" : ""
+                    }`}
                   >
+                    <td className="px-4 py-4" onClick={(e) => e.stopPropagation()}>
+                      {DELETABLE.has(dep.status) && (
+                        <input
+                          type="checkbox"
+                          checked={selected.has(dep.id)}
+                          onChange={() => toggleOne(dep.id)}
+                          aria-label={`Select ${dep.website_name}`}
+                          className="w-4 h-4 accent-[#2563EB] cursor-pointer"
+                        />
+                      )}
+                    </td>
                     <td className="px-6 py-4 font-medium text-gray-900">
                       {dep.website_name}
                     </td>
@@ -245,7 +822,7 @@ export default function DeploymentHistory() {
                         >
                           View
                         </button>
-                        {(dep.status === "success" || dep.status === "failed") && (
+                        {DELETABLE.has(dep.status) && (
                           <button
                             onClick={(e) => handleDelete(e, dep)}
                             disabled={deleting[dep.id]}
@@ -270,6 +847,17 @@ export default function DeploymentHistory() {
             </table>
           </div>
         </div>
+      )}
+
+      {bulkRequest && (
+        <BulkDeleteDialog
+          request={bulkRequest}
+          onClose={() => setBulkRequest(null)}
+          onCompleted={() => {
+            setSelected(new Set());
+            fetchData();
+          }}
+        />
       )}
     </div>
   );

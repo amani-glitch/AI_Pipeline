@@ -8,14 +8,18 @@ the codebase.
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Sequence
 
 from google.cloud.firestore_v1 import Client as FirestoreClient
 
 from models.enums import DeploymentStatus, LogLevel, PipelineStep, StepStatus, UserStatus
+
+logger = logging.getLogger("webdeploy.crud")
 
 # Collection names
 _DEPLOYMENTS = "deployments"
@@ -84,16 +88,132 @@ def get_deployment(db: FirestoreClient, deployment_id: str) -> Optional[SimpleNa
     return _doc_to_record(doc)
 
 
+def _deployments_query(
+    db: FirestoreClient,
+    *,
+    start_utc: Optional[datetime] = None,
+    end_utc: Optional[datetime] = None,
+):
+    """
+    Base deployments query, newest first, optionally bounded by ``created_at``.
+
+    ``start_utc`` is inclusive and ``end_utc`` exclusive — the same convention
+    as ``stats_queries.query_deployments_in_range``.  The range and the sort
+    both use ``created_at``, so no composite index is required.
+    """
+    query = db.collection(_DEPLOYMENTS)
+    if start_utc is not None:
+        query = query.where("created_at", ">=", start_utc)
+    if end_utc is not None:
+        query = query.where("created_at", "<", end_utc)
+    return query.order_by("created_at", direction="DESCENDING")
+
+
+# Fields the in-Python predicate reads — the projection used when counting.
+_FILTER_FIELDS = ["deployer_email", "mode", "status"]
+
+
+def _record_predicate(
+    deployer_email: Optional[str],
+    modes: Optional[Sequence[str]],
+    statuses: Optional[Sequence[str]],
+):
+    """
+    Build a predicate for the filters that cannot ride along with the
+    ``created_at`` range in Firestore without a composite index, or ``None``
+    when no such filter is active.
+    """
+    if deployer_email is None and modes is None and statuses is None:
+        return None
+
+    mode_set = set(modes) if modes is not None else None
+    status_set = set(statuses) if statuses is not None else None
+
+    def matches(record) -> bool:
+        if (
+            deployer_email is not None
+            and getattr(record, "deployer_email", "") != deployer_email
+        ):
+            return False
+        if mode_set is not None and getattr(record, "mode", "") not in mode_set:
+            return False
+        if status_set is not None and getattr(record, "status", "") not in status_set:
+            return False
+        return True
+
+    return matches
+
+
 def list_deployments(
-    db: FirestoreClient, limit: int = 100, offset: int = 0,
+    db: FirestoreClient,
+    limit: int = 100,
+    offset: int = 0,
+    *,
+    start_utc: Optional[datetime] = None,
+    end_utc: Optional[datetime] = None,
+    deployer_email: Optional[str] = None,
+    modes: Optional[Sequence[str]] = None,
+    statuses: Optional[Sequence[str]] = None,
 ) -> list[SimpleNamespace]:
-    query = (
-        db.collection(_DEPLOYMENTS)
-        .order_by("created_at", direction="DESCENDING")
-        .offset(offset)
-        .limit(limit)
+    """
+    Return deployments newest-first, optionally restricted to a ``created_at``
+    window, a single deployer, a set of modes, and/or a set of statuses.
+
+    Everything except the date range is matched in Python so that no composite
+    index is needed.  Limit and offset are therefore applied *after* filtering —
+    pushing them down would mean a caller only ever sees whichever matching rows
+    happen to land inside the first ``limit`` rows globally.
+    """
+    query = _deployments_query(db, start_utc=start_utc, end_utc=end_utc)
+    predicate = _record_predicate(deployer_email, modes, statuses)
+
+    if predicate is None:
+        return [
+            _doc_to_record(doc)
+            for doc in query.offset(offset).limit(limit).stream()
+        ]
+
+    kept = (
+        record
+        for record in (_doc_to_record(doc) for doc in query.stream())
+        if predicate(record)
     )
-    return [_doc_to_record(doc) for doc in query.stream()]
+    return list(itertools.islice(kept, offset, offset + limit))
+
+
+def count_deployments(
+    db: FirestoreClient,
+    *,
+    start_utc: Optional[datetime] = None,
+    end_utc: Optional[datetime] = None,
+    deployer_email: Optional[str] = None,
+    modes: Optional[Sequence[str]] = None,
+    statuses: Optional[Sequence[str]] = None,
+) -> int:
+    """
+    Count deployments matching the same filters as :func:`list_deployments`,
+    ignoring limit/offset — lets callers report how many rows exist beyond the
+    page they were served.
+    """
+    query = _deployments_query(db, start_utc=start_utc, end_utc=end_utc)
+    predicate = _record_predicate(deployer_email, modes, statuses)
+
+    if predicate is not None:
+        return sum(
+            1
+            for doc in query.select(_FILTER_FIELDS).stream()
+            if predicate(_doc_to_record(doc))
+        )
+
+    try:
+        # Aggregation query — one read instead of one per document.
+        return int(query.count().get()[0][0].value)
+    except Exception:
+        logger.warning(
+            "Firestore count() aggregation unavailable; falling back to a scan.",
+            exc_info=True,
+        )
+        return sum(1 for _ in query.select([]).stream())
 
 
 def delete_deployment(db: FirestoreClient, deployment_id: str) -> bool:

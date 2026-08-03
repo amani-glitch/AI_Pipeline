@@ -374,6 +374,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Readable by the browser when the frontend is served from another origin
+    # (Cloud Run), not just through the Vite dev proxy.
+    expose_headers=["X-Total-Count"],
 )
 
 # ── Register routers ─────────────────────────────────────────────────

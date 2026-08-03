@@ -37,12 +37,35 @@ export async function deployFromGit(body) {
 }
 
 /**
- * List all deployments.
- * @returns {Promise<object[]>} Array of deployment objects.
+ * List deployments, newest first, optionally restricted to a date range.
+ * @param {object} [options]
+ * @param {string} [options.startDate] - Earliest day to include, YYYY-MM-DD.
+ * @param {string} [options.endDate] - Latest day to include, YYYY-MM-DD.
+ * @param {number} [options.limit] - Page size (server default 1000, max 5000).
+ * @param {number} [options.offset] - Rows to skip.
+ * @returns {Promise<{deployments: object[], total: number}>} The page, plus how
+ *   many deployments match the range in total (may exceed the page length).
  */
-export async function getDeployments() {
-  const response = await api.get("/api/deployments");
-  return response.data;
+export async function getDeployments({
+  startDate, endDate, modes, limit, offset,
+} = {}) {
+  // URLSearchParams so repeated `mode` params stay `mode=a&mode=b` — axios
+  // would otherwise serialise the array as `mode[]=`, which FastAPI ignores.
+  const params = new URLSearchParams();
+  if (startDate) params.append("start_date", startDate);
+  if (endDate) params.append("end_date", endDate);
+  if (limit) params.append("limit", limit);
+  if (offset) params.append("offset", offset);
+  (modes || []).forEach((mode) => params.append("mode", mode));
+
+  const response = await api.get("/api/deployments", { params });
+  const deployments = Array.isArray(response.data) ? response.data : [];
+  const total = Number(response.headers["x-total-count"]);
+
+  return {
+    deployments,
+    total: Number.isFinite(total) ? total : deployments.length,
+  };
 }
 
 /**
@@ -72,6 +95,41 @@ export async function getDeploymentLogs(id) {
  */
 export async function deleteDeployment(id) {
   const response = await api.delete(`/api/deployments/${id}`);
+  return response.data;
+}
+
+/**
+ * Delete several deployments at once, by explicit ids or by date range + mode.
+ *
+ * Always preview first with `dryRun: true`, then repeat with `dryRun: false`
+ * and `expectedCount` set to the number the preview reported — the server
+ * refuses the run if the set has shifted in between.
+ *
+ * @param {object} options
+ * @param {string[]} [options.ids] - Explicit selection; ignores the filters.
+ * @param {string} [options.startDate] - YYYY-MM-DD.
+ * @param {string} [options.endDate] - YYYY-MM-DD.
+ * @param {string[]} [options.modes] - e.g. ["demo", "cloudrun"].
+ * @param {boolean} [options.includeProd] - Prod is skipped unless set.
+ * @param {boolean} [options.dryRun] - Defaults to true server-side.
+ * @param {number} [options.expectedCount] - Required when dryRun is false.
+ * @returns {Promise<object>} { dry_run, matched, deleted_count, failed_count,
+ *   items, warnings }
+ */
+export async function bulkDeleteDeployments({
+  ids, startDate, endDate, modes, includeProd, dryRun, expectedCount,
+} = {}) {
+  const body = { dry_run: dryRun !== false };
+  if (ids) body.ids = ids;
+  if (startDate) body.start_date = startDate;
+  if (endDate) body.end_date = endDate;
+  if (modes?.length) body.modes = modes;
+  if (includeProd) body.include_prod = true;
+  if (expectedCount != null) body.expected_count = expectedCount;
+
+  const response = await api.post("/api/deployments/bulk-delete", body, {
+    timeout: 600000, // tearing down GCP resources one by one is slow
+  });
   return response.data;
 }
 
