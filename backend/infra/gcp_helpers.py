@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import google.auth
 from google.oauth2 import service_account
+from googleapiclient import errors as api_errors
 from googleapiclient.discovery import Resource
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,87 @@ def wait_for_global_operation(
         time.sleep(poll_interval)
         # Gradual back-off up to 10s
         poll_interval = min(poll_interval * 1.3, 10.0)
+
+
+# =====================================================================
+#  URL Map Mutation (shared, concurrency-safe)
+# =====================================================================
+
+# Every deploy/delete that touches a URL map (e.g. the demo LB's "test-lb")
+# does get-modify-patch against the *same* resource. One lock per URL map
+# name serializes same-process callers so they queue instead of racing.
+_url_map_locks: dict[str, threading.Lock] = {}
+_url_map_locks_guard = threading.Lock()
+
+
+def _get_url_map_lock(url_map_name: str) -> threading.Lock:
+    with _url_map_locks_guard:
+        lock = _url_map_locks.get(url_map_name)
+        if lock is None:
+            lock = _url_map_locks[url_map_name] = threading.Lock()
+        return lock
+
+
+def mutate_url_map(
+    compute: Resource,
+    project_id: str,
+    url_map_name: str,
+    mutate_fn: Callable[[dict[str, Any]], bool],
+    max_retries: int = 5,
+    base_delay: float = 5.0,
+) -> None:
+    """Fetch a URL map, apply ``mutate_fn`` to it, and patch it back.
+
+    A URL map is a single shared resource that many deploys/deletes mutate
+    concurrently via get-modify-patch, which races in two ways GCP surfaces
+    as errors rather than serializing itself:
+
+    - ``412 Invalid fingerprint``: another patch landed between our GET and
+      PATCH, invalidating the optimistic-lock fingerprint we sent.
+    - ``400 resourceNotReady``: the map is still applying a just-submitted
+      change and briefly refuses new patches.
+
+    Both are transient — re-fetching the map (for a fresh fingerprint) and
+    retrying resolves them, which is why the retry loop re-runs ``mutate_fn``
+    against a fresh GET each attempt rather than reusing the stale body. A
+    per-process lock on ``url_map_name`` additionally serializes same-process
+    callers so they queue instead of racing and retrying.
+
+    Args:
+        mutate_fn: Receives the freshly-fetched URL map body and mutates it
+            in place. Returns whether a patch is actually needed — ``False``
+            short-circuits as a no-op (e.g. the desired state already
+            exists), skipping the PATCH call entirely.
+    """
+    with _get_url_map_lock(url_map_name):
+        for attempt in range(1, max_retries + 1):
+            url_map = (
+                compute.urlMaps().get(project=project_id, urlMap=url_map_name).execute()
+            )
+            if not mutate_fn(url_map):
+                return
+            try:
+                operation = (
+                    compute.urlMaps()
+                    .patch(project=project_id, urlMap=url_map_name, body=url_map)
+                    .execute()
+                )
+                wait_for_global_operation(compute, project_id, operation["name"])
+                return
+            except api_errors.HttpError as err:
+                retryable = err.resp.status == 412 or (
+                    err.resp.status == 400 and "resourceNotReady" in str(err)
+                )
+                if retryable and attempt < max_retries:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "URL map '%s' patch conflict (attempt %d/%d, status %s) — "
+                        "retrying in %ds...",
+                        url_map_name, attempt, max_retries, err.resp.status, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise
 
 
 # =====================================================================

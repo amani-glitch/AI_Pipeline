@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any, Callable, Optional
 
 from google.cloud import storage as gcs
@@ -34,6 +33,7 @@ from infra.gcp_helpers import (
     get_backend_bucket_name,
     get_bucket_name,
     get_credentials,
+    mutate_url_map,
     safe_name,
     wait_for_global_operation,
 )
@@ -325,19 +325,9 @@ class SubdomainDeployer:
         await self._emit(f"[INFRA] Adding host rule for '{fqdn}' to demo URL map")
 
         def _update() -> None:
-            for attempt in range(1, 6):
-                try:
-                    self._patch_url_map_host_rule(
-                        url_map_name, f"pm-sub-{sname}", fqdn, backend_bucket_name,
-                    )
-                    return
-                except api_errors.HttpError as err:
-                    if err.resp.status == 400 and "resourceNotReady" in str(err) and attempt < 5:
-                        delay = 5 * (2 ** (attempt - 1))
-                        logger.warning("Backend not ready (%d/5) — retry in %ds", attempt, delay)
-                        time.sleep(delay)
-                        continue
-                    raise
+            self._patch_url_map_host_rule(
+                url_map_name, f"pm-sub-{sname}", fqdn, backend_bucket_name,
+            )
 
         await self._run_sync(_update)
         await self._emit(f"[INFRA] Host rule added for '{fqdn}' on demo LB")
@@ -410,19 +400,9 @@ class SubdomainDeployer:
         await self._emit(f"[INFRA] Adding host rule for '{fqdn}' to prod URL map")
 
         def _update() -> None:
-            for attempt in range(1, 6):
-                try:
-                    self._patch_url_map_host_rule(
-                        url_map_name, f"pm-{safe_fqdn}", fqdn, backend_bucket_name,
-                    )
-                    return
-                except api_errors.HttpError as err:
-                    if err.resp.status == 400 and "resourceNotReady" in str(err) and attempt < 5:
-                        delay = 5 * (2 ** (attempt - 1))
-                        logger.warning("Backend not ready (%d/5) — retry in %ds", attempt, delay)
-                        time.sleep(delay)
-                        continue
-                    raise
+            self._patch_url_map_host_rule(
+                url_map_name, f"pm-{safe_fqdn}", fqdn, backend_bucket_name,
+            )
 
         await self._run_sync(_update)
         await self._emit(f"[INFRA] Host rule added for '{fqdn}' on prod LB")
@@ -500,20 +480,7 @@ class SubdomainDeployer:
         self, url_map_name: str, matcher_name: str, fqdn: str, backend_bucket_name: str,
     ) -> None:
         """Add a host rule + path matcher for the FQDN to a URL map."""
-        url_map = (
-            self._compute.urlMaps()
-            .get(project=self._project_id, urlMap=url_map_name)
-            .execute()
-        )
-
-        # Check if host rule already exists
-        host_rules: list[dict] = url_map.get("hostRules", [])
-        for hr in host_rules:
-            if fqdn in hr.get("hosts", []):
-                logger.info("Host rule for '%s' already exists — skipping.", fqdn)
-                return
-
-        # Resolve backend bucket self-link
+        # Resolve backend bucket self-link once; it doesn't change across retries.
         bb_resource = (
             self._compute.backendBuckets()
             .get(project=self._project_id, backendBucket=backend_bucket_name)
@@ -521,29 +488,32 @@ class SubdomainDeployer:
         )
         bb_self_link = bb_resource["selfLink"]
 
-        # Add path matcher (replace if same name exists for idempotency)
-        path_matchers: list[dict] = url_map.get("pathMatchers", [])
-        path_matchers = [pm for pm in path_matchers if pm.get("name") != matcher_name]
-        path_matchers.append({
-            "name": matcher_name,
-            "defaultService": bb_self_link,
-        })
-        url_map["pathMatchers"] = path_matchers
+        def _mutate(url_map: dict) -> bool:
+            # Check if host rule already exists
+            host_rules: list[dict] = url_map.get("hostRules", [])
+            for hr in host_rules:
+                if fqdn in hr.get("hosts", []):
+                    logger.info("Host rule for '%s' already exists — skipping.", fqdn)
+                    return False
 
-        # Add host rule
-        host_rules.append({
-            "hosts": [fqdn],
-            "pathMatcher": matcher_name,
-        })
-        url_map["hostRules"] = host_rules
+            # Add path matcher (replace if same name exists for idempotency)
+            path_matchers: list[dict] = url_map.get("pathMatchers", [])
+            path_matchers = [pm for pm in path_matchers if pm.get("name") != matcher_name]
+            path_matchers.append({
+                "name": matcher_name,
+                "defaultService": bb_self_link,
+            })
+            url_map["pathMatchers"] = path_matchers
 
-        # Patch
-        operation = (
-            self._compute.urlMaps()
-            .patch(project=self._project_id, urlMap=url_map_name, body=url_map)
-            .execute()
-        )
-        wait_for_global_operation(self._compute, self._project_id, operation["name"])
+            # Add host rule
+            host_rules.append({
+                "hosts": [fqdn],
+                "pathMatcher": matcher_name,
+            })
+            url_map["hostRules"] = host_rules
+            return True
+
+        mutate_url_map(self._compute, self._project_id, url_map_name, _mutate)
         logger.info("URL map '%s': host rule for '%s' -> %s", url_map_name, fqdn, backend_bucket_name)
 
     # =================================================================
@@ -567,28 +537,21 @@ class SubdomainDeployer:
     ) -> None:
         await self._emit(f"[DELETE] Removing host rule for {fqdn}")
 
+        def _mutate(url_map: dict) -> bool:
+            host_rules = url_map.get("hostRules", [])
+            path_matchers = url_map.get("pathMatchers", [])
+            new_host_rules = [hr for hr in host_rules if fqdn not in hr.get("hosts", [])]
+            new_path_matchers = [pm for pm in path_matchers if pm.get("name") != matcher_name]
+
+            if len(new_host_rules) == len(host_rules) and len(new_path_matchers) == len(path_matchers):
+                return False  # nothing to remove — already gone
+
+            url_map["hostRules"] = new_host_rules
+            url_map["pathMatchers"] = new_path_matchers
+            return True
+
         def _update() -> None:
-            url_map = (
-                self._compute.urlMaps()
-                .get(project=self._project_id, urlMap=url_map_name)
-                .execute()
-            )
-
-            url_map["hostRules"] = [
-                hr for hr in url_map.get("hostRules", [])
-                if fqdn not in hr.get("hosts", [])
-            ]
-            url_map["pathMatchers"] = [
-                pm for pm in url_map.get("pathMatchers", [])
-                if pm.get("name") != matcher_name
-            ]
-
-            operation = (
-                self._compute.urlMaps()
-                .patch(project=self._project_id, urlMap=url_map_name, body=url_map)
-                .execute()
-            )
-            wait_for_global_operation(self._compute, self._project_id, operation["name"])
+            mutate_url_map(self._compute, self._project_id, url_map_name, _mutate)
             logger.info("Removed host rule for %s from URL map %s.", fqdn, url_map_name)
 
         await self._run_sync(_update)
