@@ -16,7 +16,6 @@ from typing import Callable, Optional
 from google.cloud import storage
 
 from config import Settings
-from models.enums import DeploymentMode
 
 logger = logging.getLogger("webdeploy.upload_service")
 
@@ -73,11 +72,12 @@ class UploadService:
         self,
         dist_path: str,
         bucket_name: str,
-        website_name: str,
-        mode: DeploymentMode,
+        prefix: str = "",
+        main_html_file: str = "index.html",
+        dedicated_bucket: bool = True,
     ) -> int:
         """
-        Upload all files in *dist_path* to the GCS bucket.
+        Publish *dist_path* as the website's current version.
 
         Parameters
         ----------
@@ -85,96 +85,110 @@ class UploadService:
             Absolute path to the built ``dist/`` directory.
         bucket_name : str
             GCS bucket name.
-        website_name : str
-            Deployment name (used as prefix in demo mode).
-        mode : DeploymentMode
-            demo or prod — determines the upload prefix.
+        prefix : str
+            Object prefix the site lives under ("{site}/" for path-routed
+            demo sites, "" for a dedicated bucket).
+        main_html_file : str
+            Entry page. Buckets serve ``index.html`` for directory URLs, so a
+            differently-named entry page is also published as ``index.html``.
+        dedicated_bucket : bool
+            The bucket belongs to this website alone (False for the shared
+            demo bucket), so its website config is aligned to ``index.html``
+            on every deploy. Older buckets were configured once at creation
+            with whatever the first version's entry page was called.
 
-        Returns
-        -------
-        int
-            Number of files uploaded.
+        After every file uploads, objects under *prefix* that the new version
+        no longer contains are deleted: a redeploy replaces the site instead
+        of layering on top of it (old hashed bundles and removed pages used to
+        stay reachable forever). Pruning runs only after a fully successful
+        upload, so a failed deploy never leaves the site half-emptied.
+
+        Returns the number of files uploaded.
 
         Raises
         ------
         RuntimeError
-            If the upload encounters a critical failure.
+            If any file fails to upload (after retries).
         """
-        self._log(f"Starting upload to gs://{bucket_name}/", level="INFO", step="UPLOAD")
+        if prefix and (not prefix.endswith("/") or prefix.startswith("/") or ".." in prefix):
+            raise ValueError(f"Invalid upload prefix {prefix!r}")
+        if not dedicated_bucket and not prefix:
+            # Pruning a shared bucket at its root would delete every other site.
+            raise ValueError("A shared bucket needs a per-site upload prefix")
+        self._log(f"Starting upload to gs://{bucket_name}/{prefix}", level="INFO", step="UPLOAD")
 
-        # Determine the object name prefix
-        prefix = f"{website_name}/" if mode == DeploymentMode.DEMO else ""
-        self._log(
-            f"Upload prefix: '{prefix}' (mode={mode.value})",
-            level="INFO",
-            step="UPLOAD",
-        )
-
-        # Collect files to upload
         file_list = self._collect_files(dist_path)
         total = len(file_list)
         if total == 0:
             raise RuntimeError(f"No files found in dist directory: {dist_path}")
 
+        names = {rel for rel, _ in file_list}
+        if "index.html" not in names and main_html_file in names:
+            source = dict(file_list)[main_html_file]
+            file_list.append(("index.html", source))
+            self._log(
+                f"Entry page is {main_html_file} — also publishing it as index.html",
+                level="INFO", step="UPLOAD",
+            )
+        total = len(file_list)
         self._log(f"Found {total} file(s) to upload", level="INFO", step="UPLOAD")
 
-        # Get the bucket
         client = self._get_client()
         bucket = client.bucket(bucket_name)
 
-        # Upload in parallel
         uploaded = 0
-        failed = 0
-
+        failures: list[str] = []
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-            futures = {}
-            for rel_path, abs_path in file_list:
-                object_name = f"{prefix}{rel_path}"
-                future = executor.submit(
-                    self._upload_file,
-                    bucket=bucket,
-                    abs_path=abs_path,
-                    object_name=object_name,
-                )
-                futures[future] = (rel_path, object_name)
-
+            futures = {
+                executor.submit(
+                    self._upload_file, bucket=bucket, abs_path=abs_path,
+                    object_name=f"{prefix}{rel_path}",
+                ): rel_path
+                for rel_path, abs_path in file_list
+            }
             for future in as_completed(futures):
-                rel_path, object_name = futures[future]
+                rel_path = futures[future]
                 try:
                     future.result()
                     uploaded += 1
-                    # Log progress every 10 files or on the last file
                     if uploaded % 10 == 0 or uploaded == total:
-                        self._log(
-                            f"Uploaded {uploaded}/{total} files",
-                            level="INFO",
-                            step="UPLOAD",
-                        )
+                        self._log(f"Uploaded {uploaded}/{total} files", level="INFO", step="UPLOAD")
                 except Exception as exc:
-                    failed += 1
-                    self._log(
-                        f"Failed to upload {rel_path}: {exc}",
-                        level="ERROR",
-                        step="UPLOAD",
-                    )
+                    failures.append(rel_path)
+                    self._log(f"Failed to upload {rel_path}: {exc}", level="ERROR", step="UPLOAD")
 
-        if failed > 0:
-            self._log(
-                f"Upload completed with {failed} failure(s) out of {total} files",
-                level="WARNING",
-                step="UPLOAD",
+        if failures:
+            # A site with missing files is broken, not "mostly deployed".
+            raise RuntimeError(
+                f"{len(failures)} of {total} files failed to upload "
+                f"(e.g. {', '.join(sorted(failures)[:3])}). Check GCS permissions and retry."
             )
-            if failed == total:
-                raise RuntimeError(
-                    f"All {total} uploads failed. Check GCS credentials and bucket permissions."
-                )
 
+        if dedicated_bucket:
+            # Before pruning: the old entry page may be what the config points at.
+            from infra.resources import set_website_config
+            set_website_config(client.get_bucket(bucket_name), "index.html", "index.html")
+
+        pruned = self._prune(client, bucket_name, prefix, {f"{prefix}{rel}" for rel, _ in file_list})
         self._log(
-            f"Upload complete: {uploaded}/{total} files to gs://{bucket_name}/{prefix}",
+            f"Upload complete: {uploaded} files to gs://{bucket_name}/{prefix}"
+            + (f", {pruned} stale file(s) from the previous version removed" if pruned else ""),
             level="INFO",
             step="UPLOAD",
         )
         return uploaded
+
+    def _prune(self, client: storage.Client, bucket_name: str, prefix: str, keep: set[str]) -> int:
+        stale = [
+            blob for blob in client.list_blobs(bucket_name, prefix=prefix or None)
+            if blob.name not in keep
+        ]
+        for blob in stale:
+            try:
+                blob.delete()
+            except Exception as exc:
+                self._log(f"Could not remove stale {blob.name}: {exc}", level="WARNING", step="UPLOAD")
+        return len(stale)
 
     # ── Private helpers ───────────────────────────────────────────────
 

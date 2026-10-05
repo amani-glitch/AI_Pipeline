@@ -84,75 +84,40 @@ Utilisateur                Frontend (React)               Backend (FastAPI)     
 
 ## Modes de Deploiement
 
-### 1. Mode Demo
+Tous les **nouveaux** sites passent par un load balancer dedie a la plateforme,
+`webdeploy-sites` (IP `webdeploy-sites-ip`). Les sites crees avant lui restent
+sur leur ancien LB (`test-lb` / `websites-urlmap-prod`) : un redeploiement ne
+change donc jamais une URL deja partagee. Voir [docs/DEPLOYMENT-MODES.md](docs/DEPLOYMENT-MODES.md).
 
-Deploie sur un **load balancer partage** sous un domaine commun pour des tests rapides.
+### 1. Mode Demo
 
 | Aspect | Detail |
 |--------|--------|
-| **URL** | `https://digitaldatatest.com/{website_name}/` |
-| **Infra** | LB partage + IP partagee (pre-existante) |
-| **Cree** | Bucket GCS, backend bucket (CDN), regle de chemin dans l'URL map |
+| **URL** | `https://demo.digitaldatatest.com/{website_name}/` (anciens sites : `https://digitaldatatest.com/{website_name}/`) |
+| **Infra** | LB `webdeploy-sites` — **un seul** bucket partage + **un seul** backend bucket CDN pour tous les sites demo |
+| **Cree par site** | Un prefixe d'objets `{website_name}/` dans le bucket partage — aucune regle d'URL map, aucun backend bucket |
 | **Routage** | Path-based (`/nom-du-site/*`) |
-| **Cas d'usage** | Prototypage rapide, tests, previews |
-| **Cout** | Tres faible (infrastructure partagee) |
+
+Pourquoi un bucket partage : `test-lb` est plein. GCP limite une URL map a 64 kB
+(~530 regles) et le projet a 600 backend buckets (569 utilises). Un site demo qui
+ne consomme ni regle ni backend bucket ne remplit plus rien.
 
 ### 2. Mode Production
-
-Deploie sur un **load balancer partage** avec routage par nom d'hote (host-based routing) et un domaine personnalise.
 
 | Aspect | Detail |
 |--------|--------|
 | **URL** | `https://{domaine-personnalise}/` |
-| **Infra partagee** | LB `websites-urlmap-prod`, IP `websites-lb-ip-prod`, HTTPS proxy `websites-https-proxy-prod` |
-| **Cree par site** | Bucket GCS + backend bucket CDN + certificat SSL + zone DNS |
-| **Met a jour** | Host rule dans l'URL map partagee + certificat SSL dans le proxy HTTPS |
-| **SSL** | Certificat Google-managed (auto-renouvele, jusqu'a 15 certs par proxy) |
-| **DNS** | Zone Cloud DNS automatique avec enregistrements A + CNAME (www) |
-| **Domaines externes** | Support GoDaddy, OVH, Namecheap... (nameservers affiches pour configuration) |
-| **Cas d'usage** | Sites web en production |
-
-**Architecture du Load Balancer Partage (Prod) :**
-
-```
-        IP Partagee (34.49.18.135)
-               │
-    ┌──────────▼───────────┐
-    │  Forwarding Rules     │  (ports 80 + 443)
-    │  (HTTP + HTTPS)       │
-    └──────────┬────────────┘
-               │
-    ┌──────────▼───────────┐
-    │  Target Proxies       │  websites-https-proxy-prod
-    │  (+ SSL Certs)        │  (certificats SSL de tous les sites)
-    └──────────┬────────────┘
-               │
-    ┌──────────▼───────────┐
-    │  URL Map              │  websites-urlmap-prod
-    │  (Host-based routing) │
-    └──┬───────┬────────┬───┘
-       │       │        │
-  site1.com  site2.fr  site3.co.uk
-       │       │        │
-  Backend   Backend   Backend
-  Bucket1   Bucket2   Bucket3
-       │       │        │
-  Storage   Storage   Storage
-  Bucket1   Bucket2   Bucket3
-```
+| **Infra** | LB `webdeploy-sites` (host-based) ; certificats via **Certificate Manager** (certificate map — pas de limite de 15 certs par proxy) |
+| **Cree par site** | Bucket `{projet}-wd-{domaine}` + backend bucket CDN `wd-{domaine}` + host rule/path matcher + certificat Google-managed + entrees de certificate map + DNS (A, CNAME www) |
+| **DNS** | Enregistrements dans la zone Cloud DNS existante, ou zone dediee creee (nameservers affiches) |
 
 ### 3. Mode Cloud Run
 
-Deploie une **application conteneurisee** (Node.js, Python, full-stack) sur Cloud Run.
-
 | Aspect | Detail |
 |--------|--------|
-| **URL** | `https://{service}-{hash}.run.app` |
-| **Infra** | Image Docker (Artifact Registry) + Service Cloud Run |
-| **Cree** | Image Docker (via Cloud Build) + service Cloud Run |
-| **Dockerfile** | Auto-genere selon le type de projet |
-| **Ressources** | CPU: 1, RAM: 512Mi, Max instances: 10 |
-| **Cas d'usage** | Apps dynamiques, APIs, SSR |
+| **URL** | `https://{website_name}.digitaldatatest.com/` (l'URL `*.run.app` reste disponible) |
+| **Cree** | Image Docker (Cloud Build) + service Cloud Run + serverless NEG + backend service + host rule + enregistrement DNS A |
+| **SSL** | Certificat wildcard `*.digitaldatatest.com` (autorisation DNS) |
 
 ---
 
@@ -192,43 +157,64 @@ NOTIFY        → Toujours execute (meme en cas d'erreur)
 
 ## Infrastructure GCP
 
-### Ressources Partagees (pre-existantes, jamais creees par la pipeline)
+### Load balancer dedie `webdeploy-sites`
 
-| Ressource | Nom | Utilisation |
-|-----------|-----|-------------|
-| **IP Statique Prod** | `websites-lb-ip-prod` (34.49.18.135) | Adresse IP unique pour tous les sites prod |
-| **URL Map Prod** | `websites-urlmap-prod` | Routage host-based vers les backend buckets |
-| **HTTPS Proxy Prod** | `websites-https-proxy-prod` | Terminaison SSL (jusqu'a 15 certificats) |
-| **Forwarding Rules Prod** | `websites-https-forwarding-rule-prod` + `websites-http-forwarding-rule-prod` | Port 443 + 80 |
-| **IP Statique Demo** | `test-lb-ip` | Adresse IP pour le domaine demo |
-| **URL Map Demo** | `test-lb` | Routage path-based pour les sites demo |
+Provisionne une fois par `python -m scripts.provision_sites_lb` (idempotent, depuis `backend/`).
 
-### Ressources Creees par Site
+| Ressource | Nom |
+|-----------|-----|
+| IP globale | `webdeploy-sites-ip` |
+| URL map HTTPS / redirection HTTP | `webdeploy-sites-urlmap` / `webdeploy-sites-http-redirect` |
+| Proxies | `webdeploy-sites-https-proxy` / `webdeploy-sites-http-proxy` |
+| Forwarding rules | `webdeploy-sites-https-rule` (443) / `webdeploy-sites-http-rule` (80) |
+| Certificate map | `webdeploy-sites-certmap` (wildcard `*.digitaldatatest.com` + un cert par domaine prod) |
+| Bucket demo partage | `{projet}-webdeploy-demo-sites` + backend bucket `webdeploy-sites-demo` |
+| DNS | `demo.digitaldatatest.com` A → IP du LB |
 
-**Mode Demo :**
-- `demo-{safe_name}-bucket-demo` — Bucket Cloud Storage
-- `demo-{safe_name}-backend-demo` — Backend Bucket (CDN)
-- Path rule dans l'URL map demo
+Capacite : `GET /api/websites/sites-lb/status` (admin) donne la taille estimee de
+l'URL map. Seuls les sites prod et Cloud Run y ajoutent une entree (~150 octets).
 
-**Mode Production :**
-- `{safe_name}-bucket-prod` — Bucket Cloud Storage
-- `{safe_name}-backend-prod` — Backend Bucket (CDN)
-- `{safe_name}-ssl-cert` — Certificat SSL Google-managed
-- `{safe_name}-zone` — Zone DNS Cloud DNS (A + CNAME www)
-- Host rule + path matcher dans l'URL map prod
+### Load balancers historiques (lecture + suppression uniquement)
 
-**Mode Cloud Run :**
-- Image Docker dans Artifact Registry
-- Service Cloud Run `{safe_name}`
+`test-lb` (demo `digitaldatatest.com/{site}/`) et `websites-urlmap-prod` gardent
+leurs sites existants. Rien de nouveau n'y est ajoute ; supprimer un de ces sites
+libere sa regle, son backend bucket et son bucket.
+
+### Websites, versions et proprietaire des ressources
+
+Un **website** (`demo:{nom}`, `prod:{domaine}`, `cloudrun:{nom}`) possede les
+ressources GCP ; chaque **deploiement** en est une version. Collection Firestore
+`websites/{key}` : placement (LB), URL, version courante, etat de suppression.
+
+Les noms des ressources sont definis a un seul endroit, `infra/layout.py`, lu a
+la fois par les deployers et par le moteur de suppression.
+
+### Suppression (unitaire et en masse)
+
+Supprimer un deploiement supprime **le website** : toutes ses versions, ses
+ressources, ses logs et ses ZIP de sauvegarde. Une version ancienne peut aussi
+etre retiree seule de l'historique (`scope=record`) sans toucher au site.
+
+- **Plan** (`infra/teardown.py`) : etapes ordonnees et idempotentes — routage →
+  certificats → backends → stockage → DNS → Cloud Run/images. Un « deja supprime »
+  compte comme termine.
+- **Echec partiel** : l'execution s'arrete a l'etape en echec, le website passe en
+  `delete_failed` (visible dans l'historique) ; relancer reprend la ou ca s'est arrete.
+- **Etats** : `active` → `deleting` (bail de 15 min) → supprime, ou `delete_failed`.
+  Un worker interrompu est detecte par le watchdog et le site redevient relancable.
+  Pas de suppression pendant un deploiement en cours, pas de deploiement pendant une suppression.
+- **Ressources partagees protegees** : une regle de routage, un bucket, un
+  certificat ou un enregistrement DNS aussi utilise par autre chose est *conserve*
+  (signale), jamais supprime. Les zones DNS ne sont supprimees que si WebDeploy les
+  a creees et qu'elles ne contiennent plus que NS/SOA.
+- **En masse** : l'apercu regroupe la selection par website ; l'UI supprime par lots
+  de 10 avec progression, et un patch d'URL map par lot au lieu d'un par site.
+- Chaque suppression reussie laisse une trace dans `website_deletions`.
 
 ### Nommage des Ressources GCP
 
-La fonction `safe_name()` convertit tout nom en nom GCP-valide :
-- Tout en minuscules
-- Points et underscores remplaces par des tirets
-- Caracteres non-alphanumeriques remplaces
-- Tronque a 63 caracteres (limite GCP)
-- Exemple : `SaintDidier2026-2032.com` → `saintdidier2026-2032-com`
+`safe_name()` convertit un nom en nom GCP-valide (minuscules, tirets, 63 car.) ;
+`bounded_name()` raccourcit les noms trop longs avec un hash pour rester uniques.
 
 ---
 
@@ -395,7 +381,13 @@ Tous les Dockerfiles generes exposent le port **8080** (exigence Cloud Run).
 | `GET` | `/api/deployments` | Liste des deploiements (params: `limit`, `offset`) |
 | `GET` | `/api/deployments/{id}` | Detail d'un deploiement |
 | `GET` | `/api/deployments/{id}/logs` | Logs d'un deploiement |
-| `DELETE` | `/api/deployments/{id}` | Supprimer un deploiement + ressources GCP |
+| `DELETE` | `/api/deployments/{id}` | Supprimer le website de ce deploiement (`?scope=record` : seulement cette entree d'historique) |
+| `POST` | `/api/deployments/bulk-delete` | Apercu : websites concernes par une selection (ids ou filtres) |
+| `GET` | `/api/websites/lookup` | Le deploiement mettra-t-il a jour un site existant ? A quelle URL ? |
+| `GET` | `/api/websites/{key}` | Detail d'un website (versions, ressources, etat) |
+| `DELETE` | `/api/websites/{key}` | Supprimer un website (502 + `delete_failed` si echec partiel : relancer) |
+| `POST` | `/api/websites/bulk-delete` | Supprimer jusqu'a 10 websites (`{"keys": [...]}`) |
+| `GET` | `/api/websites/sites-lb/status` | Capacite de l'URL map du LB dedie (admin) |
 
 ### Parametres de POST `/api/deploy`
 
@@ -969,10 +961,15 @@ Voir `backend/.env.example` pour la liste complete.
 PROJECT_ID=adp-413110
 GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
 
-# ── Demo (infra pre-existante) ───────────────────────────────
+# ── LB dedie (scripts/provision_sites_lb.py) ─────────────────
+SITES_LB_PREFIX=webdeploy-sites
+SITES_DEMO_HOST=demo.digitaldatatest.com
+SITES_APPS_DOMAIN=digitaldatatest.com
+SITES_DNS_ZONE=digitaldatatest-com
+
+# ── Demo historique (sites existants uniquement) ─────────────
 DEMO_DOMAIN=digitaldatatest.com
 DEMO_URL_MAP_NAME=test-lb
-DEMO_GLOBAL_IP_NAME=test-lb-ip
 
 # ── Production (LB partage pre-existant) ─────────────────────
 PROD_URL_MAP_NAME=websites-urlmap-prod
@@ -1025,6 +1022,7 @@ gcloud services enable dns.googleapis.com
 gcloud services enable domains.googleapis.com
 gcloud services enable firestore.googleapis.com
 gcloud services enable artifactregistry.googleapis.com
+gcloud services enable certificatemanager.googleapis.com
 
 # Roles IAM du service account
 roles/storage.admin
@@ -1038,6 +1036,7 @@ roles/iam.serviceAccountUser
 roles/iam.serviceAccountTokenCreator    # Firebase Custom Token creation
 roles/firebaseauth.admin                # Firebase Auth (get/create users)
 roles/datastore.user                    # Firestore read/write
+roles/certificatemanager.owner          # Certificats des domaines prod (creer + supprimer)
 ```
 
 ---

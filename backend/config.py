@@ -6,6 +6,7 @@ Uses pydantic-settings for validation, type coercion, and .env file support.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from pydantic_settings import BaseSettings
 
@@ -17,19 +18,29 @@ class Settings(BaseSettings):
     PROJECT_ID: str = "adp-413110"
     GOOGLE_APPLICATION_CREDENTIALS: str = ""
 
-    # Demo infrastructure (EXISTING — never created by the platform)
+    # ── Dedicated platform load balancer ("sites LB") ────────────────
+    # Every *new* website deployed by the platform (demo, prod, Cloud Run)
+    # is routed through this LB. It is provisioned once by
+    # ``scripts/provision_sites_lb.py`` and never shared with hand-made sites.
+    SITES_LB_PREFIX: str = "webdeploy-sites"
+    # Demo sites: path-based (https://{SITES_DEMO_HOST}/{site}/), all served
+    # from ONE shared bucket + backend bucket, so a demo site costs no URL map
+    # entry and no backend bucket (the two limits that filled up test-lb).
+    SITES_DEMO_HOST: str = "demo.digitaldatatest.com"
+    SITES_DEMO_BUCKET: str = ""  # defaults to "{PROJECT_ID}-webdeploy-demo-sites"
+    # Cloud Run apps: host-based (https://{app}.{SITES_APPS_DOMAIN}/) through a
+    # serverless NEG + backend service, covered by a wildcard certificate.
+    SITES_APPS_DOMAIN: str = "digitaldatatest.com"
+    # Cloud DNS zone holding SITES_DEMO_HOST and the app hostnames.
+    SITES_DNS_ZONE: str = "digitaldatatest-com"
+
+    # ── Legacy load balancers (read/teardown only for new websites) ──
+    # Websites created before the sites LB keep living where they are, so
+    # their public URLs never change; deleting them cleans these LBs up.
     DEMO_DOMAIN: str = "digitaldatatest.com"
     DEMO_URL_MAP_NAME: str = "test-lb"
-    DEMO_GLOBAL_IP_NAME: str = "test-lb-ip"
     DEMO_HTTPS_PROXY_NAME: str = "test-lb-target-proxy"
-    DEMO_WILDCARD_SSL_CERT_NAME: str = "wildcard-digitaldatatest-com"
 
-    # Prod infrastructure — shared load balancer (pre-existing)
-    PROD_URL_MAP_NAME: str = "websites-urlmap-prod"
-    PROD_GLOBAL_IP_NAME: str = "websites-lb-ip-prod"
-    PROD_HTTPS_PROXY_NAME: str = "websites-https-proxy-prod"
-
-    # Prod infrastructure — shared load balancer (pre-existing)
     PROD_URL_MAP_NAME: str = "websites-urlmap-prod"
     PROD_GLOBAL_IP_NAME: str = "websites-lb-ip-prod"
     PROD_HTTPS_PROXY_NAME: str = "websites-https-proxy-prod"
@@ -104,7 +115,9 @@ class Settings(BaseSettings):
     CLOUDRUN_ARTIFACT_REPO: str = "cloud-run-images"
     CLOUD_BUILD_TIMEOUT_SECONDS: int = 600
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # extra="ignore": a stale key left in someone's .env (settings get renamed
+    # and retired over time) must not stop the app from booting.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     # ── Derived helpers ──────────────────────────────────────────────
     @property
@@ -124,6 +137,10 @@ class Settings(BaseSettings):
         return self.DEPLOY_UPLOADS_BUCKET or f"{self.PROJECT_ID}-deploy-uploads"
 
     @property
+    def sites_demo_bucket_name(self) -> str:
+        return self.SITES_DEMO_BUCKET or f"{self.PROJECT_ID}-webdeploy-demo-sites"
+
+    @property
     def notification_emails_list(self) -> list[str]:
         if not self.NOTIFICATION_TO_EMAILS:
             return []
@@ -136,6 +153,11 @@ class Settings(BaseSettings):
         return [e.strip() for e in self.DAILY_REPORT_EMAILS.split(",") if e.strip()]
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Singleton accessor — import this in other modules."""
+    """Singleton accessor — import this in other modules.
+
+    Cached: settings come from the environment, which does not change while
+    the process runs, and re-parsing them on every request is wasted work.
+    """
     return Settings()

@@ -7,11 +7,12 @@ and bucket/backend-bucket name generation used by both demo and prod deployers.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import google.auth
 from google.oauth2 import service_account
@@ -54,6 +55,80 @@ def safe_name(name: str) -> str:
 
     logger.debug("safe_name(%r) -> %r", name, result)
     return result
+
+
+def bounded_name(name: str, max_len: int = 63) -> str:
+    """Fit a derived resource name into a GCP length limit, deterministically.
+
+    Names that already fit are returned unchanged, so existing resources keep
+    their names. Longer ones are truncated and suffixed with a short hash of
+    the full name — two long names sharing a prefix can therefore never
+    collapse onto the same resource, which plain truncation would allow.
+    """
+    if len(name) <= max_len:
+        return name
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return f"{name[: max_len - 9].rstrip('-')}-{digest}"
+
+
+# =====================================================================
+#  Error classification
+# =====================================================================
+
+def http_status(exc: BaseException) -> int | None:
+    """HTTP status of a Google API error, whichever client library raised it."""
+    if isinstance(exc, api_errors.HttpError):
+        return exc.resp.status
+    code = getattr(exc, "code", None)  # google.api_core / google.cloud errors
+    return code if isinstance(code, int) else None
+
+
+def is_not_found(exc: BaseException) -> bool:
+    return http_status(exc) == 404
+
+
+def is_in_use(exc: BaseException) -> bool:
+    """True when GCP refused a delete because another resource references it."""
+    return http_status(exc) == 400 and "resourceInUseByAnotherResource" in str(exc)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Errors worth retrying: rate limits, server errors, and resources that
+    are still settling after a previous change."""
+    status = http_status(exc)
+    if status in (429, 500, 502, 503, 504):
+        return True
+    return status == 400 and "resourceNotReady" in str(exc)
+
+
+_T = TypeVar("_T")
+
+
+def call_with_retries(
+    fn: Callable[[], _T],
+    *,
+    attempts: int = 5,
+    base_delay: float = 2.0,
+    description: str = "GCP call",
+) -> _T:
+    """Run ``fn`` and retry transient Google API failures with backoff."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == attempts or not is_transient(exc):
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "%s failed transiently (attempt %d/%d, status %s) — retrying in %.0fs",
+                description, attempt, attempts, http_status(exc), delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+class UrlMapFullError(RuntimeError):
+    """The URL map hit GCP's hard 64 kB size limit."""
 
 
 # =====================================================================
@@ -157,6 +232,54 @@ def wait_for_global_operation(
         poll_interval = min(poll_interval * 1.3, 10.0)
 
 
+def wait_for_region_operation(
+    compute: Resource,
+    project_id: str,
+    region: str,
+    operation: str,
+    timeout: int = 300,
+) -> dict[str, Any]:
+    """Regional counterpart of :func:`wait_for_global_operation`."""
+    deadline = time.monotonic() + timeout
+    poll_interval = 2.0
+    while True:
+        result = (
+            compute.regionOperations()
+            .get(project=project_id, region=region, operation=operation)
+            .execute()
+        )
+        if result.get("status") == "DONE":
+            if "error" in result:
+                errors = result["error"].get("errors", [])
+                raise RuntimeError(
+                    f"GCP operation {operation} failed: "
+                    + "; ".join(e.get("message", str(e)) for e in errors)
+                )
+            return result
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"GCP operation {operation} did not complete within {timeout}s")
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.3, 10.0)
+
+
+def wait_for_lro(get_operation: Callable[[], dict], name: str, timeout: int = 300) -> dict:
+    """Poll a google.longrunning Operation (Cloud Run, Certificate Manager,
+    Artifact Registry) until ``done``; raise if it finished with an error."""
+    deadline = time.monotonic() + timeout
+    poll_interval = 2.0
+    while True:
+        result = get_operation()
+        if result.get("done"):
+            if "error" in result:
+                error = result["error"]
+                raise RuntimeError(f"Operation {name} failed: {error.get('message', error)}")
+            return result
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Operation {name} did not complete within {timeout}s")
+        time.sleep(poll_interval)
+        poll_interval = min(poll_interval * 1.3, 10.0)
+
+
 # =====================================================================
 #  URL Map Mutation (shared, concurrency-safe)
 # =====================================================================
@@ -223,9 +346,15 @@ def mutate_url_map(
                 wait_for_global_operation(compute, project_id, operation["name"])
                 return
             except api_errors.HttpError as err:
+                if "Size of the url map exceeds" in str(err):
+                    raise UrlMapFullError(
+                        f"URL map '{url_map_name}' is full: GCP caps a URL map at "
+                        f"64 kB of routing rules. Delete unused websites routed "
+                        f"through it to free space."
+                    ) from err
                 retryable = err.resp.status == 412 or (
                     err.resp.status == 400 and "resourceNotReady" in str(err)
-                )
+                ) or err.resp.status in (429, 500, 502, 503, 504)
                 if retryable and attempt < max_retries:
                     delay = base_delay * (2 ** (attempt - 1))
                     logger.warning(

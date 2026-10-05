@@ -10,3 +10,4 @@ backend/tmp/
 .env
 backend/.env
 backend/service-account.json
+.pytest_cache/

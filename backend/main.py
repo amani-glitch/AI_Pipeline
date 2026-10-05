@@ -36,6 +36,7 @@ from api.routes.git import router as git_router
 from api.routes.admin_dashboard import router as dashboard_router
 from api.routes.quotas import router as quotas_router
 from api.routes.alerts import router as alerts_router
+from api.routes.websites import router as websites_router
 
 
 # ── Logging configuration ────────────────────────────────────────────
@@ -64,6 +65,7 @@ logger = logging.getLogger("webdeploy")
 # ── Stale deployment watchdog ─────────────────────────────────────────
 
 _MAX_AUTO_RETRIES = 2
+_QUEUED_GRACE_SECONDS = 300
 
 
 def _recover_stale_deployments() -> list[dict]:
@@ -112,6 +114,16 @@ def _recover_stale_deployments() -> list[dict]:
                             deployment_id, int(elapsed), max_age,
                         )
                         continue
+
+            # A freshly queued deployment belongs to the instance that queued
+            # it (it starts within a second). Instances start whenever Cloud
+            # Run scales out, so without this guard a new one would pick the
+            # same deployment up and run it twice.
+            created_at = data.get("created_at")
+            if stale_status == "queued" and hasattr(created_at, "timestamp"):
+                age = (now - created_at.replace(tzinfo=timezone.utc)).total_seconds()
+                if age < _QUEUED_GRACE_SECONDS:
+                    continue
 
             zip_path = settings.upload_path / f"{deployment_id}.zip"
 
@@ -250,6 +262,13 @@ async def _stale_deployment_watchdog(interval_seconds: int = 120) -> None:
                         "(running for %ds, limit %ds)",
                         deployment_id, int(elapsed), max_age,
                     )
+
+            # Website deletions whose worker died (instance recycled, request
+            # timeout) become retryable failures instead of staying "deleting".
+            from services.website_service import expire_stale_deletions
+            expired = expire_stale_deletions(db, settings)
+            if expired:
+                logger.warning("Watchdog: %d interrupted website deletion(s) marked retryable", expired)
 
         except Exception as exc:
             logger.error("Stale deployment watchdog error: %s", exc)
@@ -391,3 +410,4 @@ app.include_router(git_router)
 app.include_router(dashboard_router)
 app.include_router(quotas_router)
 app.include_router(alerts_router)
+app.include_router(websites_router)

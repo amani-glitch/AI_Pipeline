@@ -89,21 +89,53 @@ export async function getDeploymentLogs(id) {
 }
 
 /**
- * Delete a deployment and clean up its GCP resources.
+ * Remove a single deployment record from history, leaving the website (and
+ * its GCP resources) untouched. Refused by the server for the live or only
+ * version — delete the website instead.
  * @param {string} id - Deployment ID.
- * @returns {Promise<object>} Deletion result.
  */
-export async function deleteDeployment(id) {
-  const response = await api.delete(`/api/deployments/${id}`);
+export async function deleteHistoryEntry(id) {
+  const response = await api.delete(`/api/deployments/${id}`, {
+    params: { scope: "record" },
+  });
+  return response.data;
+}
+
+/** Websites per delete request — mirrors the server's MAX_WEBSITES_PER_REQUEST. */
+export const WEBSITE_DELETE_CHUNK = 10;
+
+/**
+ * Delete websites (every GCP resource and every deployment record of each).
+ * At most WEBSITE_DELETE_CHUNK keys per call.
+ * @param {string[]} keys - Website keys, e.g. ["demo:my-site", "prod:shop.com"].
+ * @returns {Promise<{results: object[], deleted_count: number,
+ *   failed_count: number, blocked_count: number}>} One result per website:
+ *   status "deleted", "delete_failed" (retry to resume) or "blocked".
+ */
+export async function deleteWebsites(keys) {
+  const response = await api.post(
+    "/api/websites/bulk-delete",
+    { keys },
+    { timeout: 900000 } // legacy-LB teardowns wait on GCP operations
+  );
   return response.data;
 }
 
 /**
- * Delete several deployments at once, by explicit ids or by date range + mode.
- *
- * Always preview first with `dryRun: true`, then repeat with `dryRun: false`
- * and `expectedCount` set to the number the preview reported — the server
- * refuses the run if the set has shifted in between.
+ * What deploying (mode, name, domain) will do: update an existing website,
+ * or create a new one — and at which URL.
+ */
+export async function lookupWebsite({ mode, websiteName, domain }) {
+  const params = { mode, website_name: websiteName };
+  if (domain) params.domain = domain;
+  const response = await api.get("/api/websites/lookup", { params });
+  return response.data;
+}
+
+/**
+ * Resolve a selection of deployments (explicit ids, or date range + mode) to
+ * the websites deleting it would remove. Use `dryRun: true` (the default) for
+ * the preview, then delete the previewed website keys with deleteWebsites().
  *
  * @param {object} options
  * @param {string[]} [options.ids] - Explicit selection; ignores the filters.

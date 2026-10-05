@@ -15,6 +15,19 @@ import {
   Link2,
 } from "lucide-react";
 
+const RESOURCE_LABELS = {
+  gcs_prefix: "Files",
+  gcs_bucket: "Storage bucket",
+  backend_bucket: "Backend bucket (CDN)",
+  backend_service: "Backend service",
+  serverless_neg: "Serverless NEG",
+  cloud_run_service: "Cloud Run service",
+  host_rule: "Host rule",
+  path_rule: "Path rule",
+  certificate: "Certificate",
+  dns: "DNS record",
+};
+
 /**
  * Deployment result banner: shown when deployment reaches a terminal state.
  *
@@ -388,8 +401,8 @@ export default function DeploymentStatus({ deployment }) {
         </div>
       )}
 
-      {/* Infrastructure recap card (prod/subdomain deployments) */}
-      {isSuccess && deployment.mode === "prod" && (
+      {/* Infrastructure recap card */}
+      {isSuccess && deployment.infra_details && (
         <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
           <div className="bg-gray-50 px-6 py-3 border-b border-gray-200">
             <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2">
@@ -444,7 +457,7 @@ export default function DeploymentStatus({ deployment }) {
               )}
 
               {/* SSL */}
-              {deployment.infra_details?.ssl_cert_created && (
+              {deployment.mode === "prod" && deployment.infra_details?.ssl_cert_created && (
                 <div className="flex items-start gap-3">
                   <Shield className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
                   <div>
@@ -459,8 +472,21 @@ export default function DeploymentStatus({ deployment }) {
                 </div>
               )}
 
+              {/* Cloud Run direct URL */}
+              {deployment.infra_details?.run_app_url && (
+                <div className="flex items-start gap-3">
+                  <Link2 className="w-4 h-4 text-teal-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">Cloud Run URL</dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900 break-all">
+                      {deployment.infra_details.run_app_url}
+                    </dd>
+                  </div>
+                </div>
+              )}
+
               {/* DNS Zone */}
-              {deployment.infra_details?.dns_zone_created && (
+              {deployment.mode === "prod" && deployment.infra_details?.dns_zone_created && (
                 <div className="flex items-start gap-3">
                   <Globe className="w-4 h-4 text-indigo-500 mt-0.5 flex-shrink-0" />
                   <div>
@@ -475,6 +501,27 @@ export default function DeploymentStatus({ deployment }) {
                 </div>
               )}
             </div>
+
+            {deployment.infra_details?.resources?.length > 0 && (
+              <div className="mt-5 pt-4 border-t border-gray-100">
+                <dt className="text-xs text-gray-500 uppercase tracking-wide mb-2">
+                  Resources of this website
+                </dt>
+                <ul className="flex flex-col gap-1">
+                  {deployment.infra_details.resources.map((r) => (
+                    <li key={`${r.kind}:${r.name}`} className="text-xs text-gray-700">
+                      <span className="inline-block min-w-[9rem] text-gray-500">
+                        {RESOURCE_LABELS[r.kind] || r.kind}
+                      </span>
+                      <span className="font-mono break-all">{r.name}</span>
+                      {r.shared_bucket && (
+                        <span className="ml-1 text-gray-400">(in the shared demo bucket)</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         </div>
       )}

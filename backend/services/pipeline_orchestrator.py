@@ -101,11 +101,16 @@ class PipelineOrchestrator:
         config: DeploymentConfig,
     ) -> None:
         """Inner pipeline logic, wrapped by run() with a timeout guard."""
+        from infra.layout import website_key
+
         log_cb = get_log_callback(deployment_id)
         ctx = PipelineContext(
             deployment_id=deployment_id,
             zip_path=zip_path,
             config=config,
+            website_key=website_key(
+                config.mode.value, config.website_name, config.domain, self._settings,
+            ),
         )
 
         failed_step: Optional[PipelineStep] = None
@@ -205,6 +210,15 @@ class PipelineOrchestrator:
                     claude_summary=ctx.claude_summary,
                     completed_at=datetime.now(timezone.utc),
                 )
+                try:
+                    from services import website_service
+                    website_service.mark_deployed(
+                        db, ctx.website_key, deployment_id=deployment_id,
+                        url=ctx.result_url, resources=ctx.infra_resources,
+                    )
+                except Exception:
+                    # The site is live either way; the pointer is informational.
+                    logger.warning("Could not update website %s", ctx.website_key, exc_info=True)
                 log_cb(
                     f"Pipeline completed successfully — URL: {ctx.result_url}",
                     level=LogLevel.INFO.value,
@@ -504,67 +518,148 @@ class PipelineOrchestrator:
         )
 
     async def _step_infra(self, ctx: PipelineContext, log_cb: Callable) -> None:
-        # The deployers expect an async log_callback(str).
-        # Wrap the orchestrator's sync log_cb for compatibility.
+        """Provision (or reuse) the website's infrastructure.
+
+        The website document decides *where* the site lives: sites created
+        before the dedicated sites LB stay on their legacy LB (redeploying
+        them must not change a URL that has been shared), everything else
+        goes to the sites LB.
+        """
+        from infra.gcp_helpers import get_credentials
+        from infra.layout import Placement
+        from services import website_service
+        from googleapiclient import discovery
+
+        settings = self._settings
+        cfg = ctx.config
+        mode = cfg.mode.value
+        step = PipelineStep.INFRA.value
+
+        def _log(message: str) -> None:
+            log_cb(message, level=LogLevel.INFO.value, step=step)
+
         async def _async_log(message: str) -> None:
-            log_cb(message, level=LogLevel.INFO.value, step=PipelineStep.INFRA.value)
+            _log(message)
 
-        if ctx.config.mode == DeploymentMode.DEMO:
+        def _resolve():
+            compute = discovery.build(
+                "compute", "v1", cache_discovery=False,
+                credentials=get_credentials(settings.GOOGLE_APPLICATION_CREDENTIALS),
+            )
+            return website_service.resolve_new_placement(
+                compute, settings, mode, cfg.website_name, cfg.domain or "",
+            )
+
+        if cfg.mode not in (DeploymentMode.DEMO, DeploymentMode.PROD, DeploymentMode.CLOUDRUN):
+            # e.g. a stale re-run of a retired "subdomain" deployment — reject
+            # before a website document is created for it.
+            raise RuntimeError(f"Mode '{mode}' can no longer be deployed")
+
+        website = await asyncio.to_thread(
+            website_service.claim_for_deploy,
+            SessionLocal(), settings,
+            key=ctx.website_key, mode=mode, website_name=cfg.website_name,
+            domain=cfg.domain, deployment_id=ctx.deployment_id,
+            deployer_email=cfg.deployer_email, resolve_placement=_resolve,
+        )
+        placement = Placement(website["placement"])
+        _log(f"[INFRA] Website {ctx.website_key} — placement: {placement.value}")
+
+        run_app_url = None
+        if cfg.mode == DeploymentMode.DEMO and placement == Placement.LEGACY_DEMO:
             from infra.demo_deployer import DemoDeployer
+            result = await DemoDeployer(config=settings, log_callback=_async_log).deploy(
+                website_name=cfg.website_name, main_html_file=ctx.main_html_file,
+            )
+            result.upload_prefix = f"{cfg.website_name}/"
+            result.cdn_url_map, result.cdn_path = settings.DEMO_URL_MAP_NAME, f"/{cfg.website_name}/*"
+            result.resources = [
+                {"kind": "gcs_bucket", "name": result.storage_bucket},
+                {"kind": "backend_bucket", "name": result.backend_bucket},
+                {"kind": "path_rule", "name": f"/{cfg.website_name}/*", "url_map": settings.DEMO_URL_MAP_NAME},
+            ]
 
-            deployer = DemoDeployer(config=self._settings, log_callback=_async_log)
-            result = await deployer.deploy(
-                website_name=ctx.config.website_name,
-                main_html_file=ctx.main_html_file,
+        elif cfg.mode == DeploymentMode.PROD and placement == Placement.LEGACY_PROD:
+            from infra.prod_deployer import ProdDeployer
+            result = await ProdDeployer(config=settings, log_callback=_async_log).deploy(
+                website_name=cfg.website_name, domain=cfg.domain, main_html_file=ctx.main_html_file,
+            )
+            result.cdn_url_map, result.cdn_host, result.cdn_path = (
+                settings.PROD_URL_MAP_NAME, cfg.domain, "/*",
+            )
+            result.resources = [
+                {"kind": "gcs_bucket", "name": result.storage_bucket},
+                {"kind": "backend_bucket", "name": result.backend_bucket},
+                {"kind": "host_rule", "name": cfg.domain, "url_map": settings.PROD_URL_MAP_NAME},
+            ]
+
+        elif cfg.mode == DeploymentMode.DEMO:
+            from infra.sites_lb import SitesLB
+            result = await asyncio.to_thread(
+                lambda: SitesLB(settings, log=_log).deploy_demo(cfg.website_name)
             )
 
-        elif ctx.config.mode == DeploymentMode.CLOUDRUN:
+        elif cfg.mode == DeploymentMode.PROD:
+            from infra.sites_lb import SitesLB
+            result = await asyncio.to_thread(
+                lambda: SitesLB(settings, log=_log).deploy_prod(cfg.website_name, cfg.domain)
+            )
+
+        elif cfg.mode == DeploymentMode.CLOUDRUN:
             from infra.cloudrun_deployer import CloudRunDeployer
-
-            deployer = CloudRunDeployer(config=self._settings, log_callback=_async_log)
-            result = await deployer.deploy(
-                website_name=ctx.config.website_name,
-                image_uri=ctx.docker_image_uri,
+            from infra.sites_lb import SitesLB
+            result = await CloudRunDeployer(config=settings, log_callback=_async_log).deploy(
+                website_name=cfg.website_name, image_uri=ctx.docker_image_uri,
             )
+            if result.success:
+                run_app_url = result.url
+                exposure = await asyncio.to_thread(
+                    lambda: SitesLB(settings, log=_log).expose_cloud_run(cfg.website_name)
+                )
+                result.url = exposure["url"]
+                result.resources = exposure["resources"]
+                result.placement, result.lb_name = Placement.SITES.value, SitesLB.lb_name(settings)
 
         else:
-            from infra.prod_deployer import ProdDeployer
-
-            deployer = ProdDeployer(config=self._settings, log_callback=_async_log)
-            result = await deployer.deploy(
-                website_name=ctx.config.website_name,
-                domain=ctx.config.domain,
-                main_html_file=ctx.main_html_file,
-            )
+            raise RuntimeError(f"Mode '{mode}' can no longer be deployed")
 
         if not result.success:
             raise RuntimeError(result.error or "Infrastructure provisioning failed")
 
         ctx.result_url = result.url
         ctx.bucket_name = result.storage_bucket
-
+        ctx.upload_prefix = result.upload_prefix
+        ctx.cdn_url_map, ctx.cdn_host, ctx.cdn_path = result.cdn_url_map, result.cdn_host, result.cdn_path
         if result.dns_nameservers:
             ctx.dns_nameservers = result.dns_nameservers
 
-        # Store infrastructure details in Firestore for the UI
-        is_prod = ctx.config.mode == DeploymentMode.PROD
+        lb_name = result.lb_name or {
+            Placement.LEGACY_DEMO: settings.DEMO_URL_MAP_NAME,
+            Placement.LEGACY_PROD: settings.PROD_URL_MAP_NAME,
+        }.get(placement)
+        is_prod = cfg.mode == DeploymentMode.PROD
         infra_update: dict = {
             "storage_bucket": result.storage_bucket or "",
             "backend_bucket": result.backend_bucket or "",
+            "website_key": ctx.website_key,
             "infra_details": {
-                "ssl_cert_created": bool(is_prod and self._settings.PROD_AUTO_CREATE_SSL_CERT),
-                "dns_zone_created": bool(is_prod and self._settings.PROD_AUTO_CREATE_DNS_ZONE),
-                "cdn_enabled": ctx.config.mode != DeploymentMode.CLOUDRUN,
-                "lb_name": (
-                    self._settings.PROD_URL_MAP_NAME if is_prod
-                    else self._settings.DEMO_URL_MAP_NAME
-                ),
+                "placement": placement.value,
+                "lb_name": lb_name,
+                "upload_prefix": result.upload_prefix,
+                "ssl_cert_created": bool(is_prod and (placement == Placement.SITES or settings.PROD_AUTO_CREATE_SSL_CERT)),
+                "dns_zone_created": bool(is_prod and settings.PROD_AUTO_CREATE_DNS_ZONE),
+                "cdn_enabled": cfg.mode != DeploymentMode.CLOUDRUN,
+                "run_app_url": run_app_url,
+                "resources": result.resources,
             },
         }
         if result.dns_nameservers:
             infra_update["dns_nameservers"] = result.dns_nameservers
-        db = SessionLocal()
-        db.collection("deployments").document(ctx.deployment_id).update(infra_update)
+        await asyncio.to_thread(
+            SessionLocal().collection("deployments").document(ctx.deployment_id).update,
+            infra_update,
+        )
+        ctx.infra_resources = result.resources
 
     async def _step_upload(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.config.mode == DeploymentMode.CLOUDRUN:
@@ -582,8 +677,9 @@ class PipelineOrchestrator:
             service.upload,
             dist_path=ctx.dist_path,
             bucket_name=ctx.bucket_name,
-            website_name=ctx.config.website_name,
-            mode=ctx.config.mode,
+            prefix=ctx.upload_prefix,
+            main_html_file=ctx.main_html_file,
+            dedicated_bucket=ctx.bucket_name != self._settings.sites_demo_bucket_name,
         )
 
         # Invalidate CDN cache so new content is served immediately
@@ -592,51 +688,33 @@ class PipelineOrchestrator:
     async def _invalidate_cdn_cache(
         self, ctx: PipelineContext, log_cb: Callable,
     ) -> None:
-        """Invalidate the CDN cache after uploading new content."""
-        from infra.gcp_helpers import get_credentials, safe_name, wait_for_global_operation
+        """Invalidate the CDN cache after uploading new content (best effort)."""
+        if not ctx.cdn_url_map or not ctx.cdn_path:
+            return
+        from infra.gcp_helpers import get_credentials, wait_for_global_operation
         from googleapiclient.discovery import build
 
+        body = {"path": ctx.cdn_path}
+        if ctx.cdn_host:
+            body["host"] = ctx.cdn_host
         log_cb(
-            "Invalidating CDN cache...",
+            f"Invalidating CDN cache on {ctx.cdn_url_map} ({ctx.cdn_host or '*'}{ctx.cdn_path})",
             level=LogLevel.INFO.value,
             step=PipelineStep.UPLOAD.value,
         )
-
         try:
             credentials = get_credentials(self._settings.GOOGLE_APPLICATION_CREDENTIALS)
             compute = build("compute", "v1", credentials=credentials, cache_discovery=False)
             project_id = self._settings.PROJECT_ID
 
-            if ctx.config.mode == DeploymentMode.DEMO:
-                url_map_name = self._settings.DEMO_URL_MAP_NAME
-                path = f"/{ctx.config.website_name}/*"
-            elif ctx.config.mode == DeploymentMode.PROD:
-                url_map_name = self._settings.PROD_URL_MAP_NAME
-                path = "/*"
-            else:
-                domain = ctx.config.domain or ctx.config.website_name
-                url_map_name = f"{safe_name(domain)}-url-map"
-                path = "/*"
-
             def _invalidate():
-                operation = (
-                    compute.urlMaps()
-                    .invalidateCache(
-                        project=project_id,
-                        urlMap=url_map_name,
-                        body={"path": path},
-                    )
-                    .execute()
-                )
+                operation = compute.urlMaps().invalidateCache(
+                    project=project_id, urlMap=ctx.cdn_url_map, body=body,
+                ).execute()
                 wait_for_global_operation(compute, project_id, operation["name"], timeout=120)
 
             await asyncio.to_thread(_invalidate)
-
-            log_cb(
-                f"CDN cache invalidated for URL map '{url_map_name}' (path: {path})",
-                level=LogLevel.INFO.value,
-                step=PipelineStep.UPLOAD.value,
-            )
+            log_cb("CDN cache invalidated", level=LogLevel.INFO.value, step=PipelineStep.UPLOAD.value)
         except Exception as exc:
             # CDN invalidation failure should not block the deployment
             logger.warning("CDN cache invalidation failed: %s", exc)

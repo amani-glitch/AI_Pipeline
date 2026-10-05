@@ -5,7 +5,7 @@ import UploadZone from "./UploadZone";
 import QuotaRequestModal from "./QuotaRequestModal";
 import {
   deployWebsite, checkDomain, createPreview, deletePreview,
-  deployFromGit, getGitPushEvents, getGitConnections,
+  deployFromGit, getGitPushEvents, getGitConnections, lookupWebsite,
 } from "../services/api";
 import { useAuth } from "../contexts/AuthContext";
 
@@ -174,6 +174,31 @@ export default function DeploymentForm() {
       }
     };
   }, [effectiveDomain, mode]);
+
+  // ── Which website this deploy targets: new, or an update of an existing one ──
+  const [siteInfo, setSiteInfo] = useState(null);
+  const lookupBackendMode = mode === "subdomain" ? "prod" : mode;
+  const lookupDomain = mode === "subdomain" ? composedSubdomainFqdn : mode === "prod" ? domain.trim() : "";
+  useEffect(() => {
+    setSiteInfo(null);
+    const name = websiteName.trim();
+    if (name.length < 2 || (lookupBackendMode === "prod" && !lookupDomain.includes("."))) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const info = await lookupWebsite({
+          mode: lookupBackendMode, websiteName: name, domain: lookupDomain,
+        });
+        if (!cancelled) setSiteInfo(info);
+      } catch {
+        // Informational only — never block a deploy on it.
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [websiteName, lookupBackendMode, lookupDomain]);
 
   // Auto-slugify website name: lowercase, replace spaces/underscores with hyphens,
   // remove non-alphanumeric characters (except hyphens), collapse multiple hyphens.
@@ -551,9 +576,23 @@ export default function DeploymentForm() {
             <p className="mt-1 text-xs text-gray-500">
               Auto-slugified: lowercase, hyphens only.
             </p>
-            {mode === "demo" && websiteName.trim() && (
+            {siteInfo && !siteInfo.exists && siteInfo.url && (
               <p className="mt-1.5 text-xs text-blue-600 font-medium">
-                URL: https://digitaldatatest.com/{websiteName.trim()}/
+                New website — URL: {siteInfo.url}
+              </p>
+            )}
+            {siteInfo?.exists && siteInfo.status && siteInfo.status !== "active" && (
+              <p className="mt-1.5 text-xs text-red-600 font-medium">
+                This website is being deleted or its deletion failed — finish the
+                deletion from the history page before deploying it again.
+              </p>
+            )}
+            {siteInfo?.exists && (!siteInfo.status || siteInfo.status === "active") && (
+              <p className="mt-1.5 text-xs text-amber-700 font-medium">
+                {siteInfo.owned_by_other
+                  ? "Another user's website already uses this name — deploying replaces its content."
+                  : `Existing website (${siteInfo.versions} version${siteInfo.versions !== 1 ? "s" : ""}) — this deploy replaces its content.`}
+                {siteInfo.url && <> URL: {siteInfo.url}</>}
               </p>
             )}
           </div>

@@ -62,16 +62,59 @@ _DELETABLE_STATUSES = (DeploymentStatus.SUCCESS.value, DeploymentStatus.FAILED.v
 # keeps the request inside a sane response time.
 MAX_BULK_DELETE = 200
 
-# How many teardowns run at once. Deliberately low: each one drives several GCP
-# APIs (URL map, buckets, Cloud Run, Artifact Registry) and the shared demo load
-# balancer is edited by every demo delete, so piling on invites 409 conflicts
-# and quota errors. Five is fast enough for a 200-item sweep without that risk.
-BULK_DELETE_CONCURRENCY = 5
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  POST /api/deploy — create a new deployment
 # ═══════════════════════════════════════════════════════════════════════
+
+def _prepare_website(db, settings: Settings, mode: str, website_name: str, domain: Optional[str]):
+    """Validate the target website and return ``(website_key, domain)``.
+
+    Refuses up front (409) when the website is being deleted or already has a
+    deployment in flight: two pipelines uploading into the same bucket
+    interleave their files, and deploying into a half-deleted website would
+    resurrect parts of it.
+    """
+    from infra.layout import normalize_domain, website_key
+    from services import website_service as ws
+
+    if len(website_name) > 63:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="website_name must be at most 63 characters.",
+        )
+    if "--" in website_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="website_name may not contain '--'.",
+        )
+    domain = normalize_domain(domain) or None
+    reserved = {
+        settings.DEMO_DOMAIN, f"www.{settings.DEMO_DOMAIN}",
+        settings.SITES_DEMO_HOST, settings.SITES_APPS_DOMAIN,
+    }
+    if mode == DeploymentMode.PROD.value and domain in reserved:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{domain}' hosts the platform's own demo sites and cannot be deployed to.",
+        )
+    if mode == DeploymentMode.CLOUDRUN.value:
+        host = f"{website_name}.{settings.SITES_APPS_DOMAIN}"
+        if website_name == "www" or host == settings.SITES_DEMO_HOST:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"'{website_name}' is reserved — choose another website name.",
+            )
+    key = website_key(mode, website_name, domain, settings)
+    try:
+        ws.check_deployable(db, key, settings)
+        if mode == DeploymentMode.CLOUDRUN.value:
+            ws.check_cloud_run_name_free(db, key, settings)
+    except ws.WebsiteConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return key, domain
+
 
 @router.post("/deploy", response_model=DeploymentCreateResponse, status_code=status.HTTP_202_ACCEPTED)
 async def create_deployment(
@@ -143,6 +186,11 @@ async def create_deployment(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A domain is required for production deployments.",
         )
+    if mode != DeploymentMode.PROD.value:
+        domain = None  # only prod websites are keyed by domain
+    website_key, domain = await asyncio.to_thread(
+        _prepare_website, db, settings, mode, website_name_lower, domain,
+    )
 
     # ── Determine upload type and validate ────────────────────────────
     has_zip = zip_file is not None and zip_file.filename
@@ -260,6 +308,7 @@ async def create_deployment(
         deployer_last_name=deployer_last_name.strip(),
         deployer_email=deployer_email_stripped,
         ai_enabled=ai_enabled_bool,
+        website_key=website_key,
     )
 
     # ── Build pipeline config ─────────────────────────────────────────
@@ -385,6 +434,10 @@ async def create_deployment_from_git(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A domain is required for production deployments.",
         )
+    website_key, domain = await asyncio.to_thread(
+        _prepare_website, db, settings, body.mode, website_name_lower,
+        body.domain if body.mode == DeploymentMode.PROD.value else None,
+    )
 
     # ── Lookup git connection ────────────────────────────────────────
     conn = crud_module.get_git_connection(db, body.connection_id)
@@ -450,13 +503,14 @@ async def create_deployment_from_git(
         deployment_id=deployment_id,
         website_name=website_name_lower,
         mode=body.mode,
-        domain=body.domain,
+        domain=domain,
         notification_emails=all_emails_str,
         zip_filename=stored_zip_filename,
         deployer_first_name=first_name,
         deployer_last_name=last_name,
         deployer_email=deployer_email_stripped,
         ai_enabled=body.ai_enabled,
+        website_key=website_key,
     )
 
     # Tag deployment with git metadata for traceability
@@ -471,7 +525,7 @@ async def create_deployment_from_git(
     deploy_config = DeploymentConfig(
         mode=DeploymentMode(body.mode),
         website_name=website_name_lower,
-        domain=body.domain,
+        domain=domain,
         notification_emails=email_list,
         deployer_first_name=first_name,
         deployer_last_name=last_name,
@@ -502,79 +556,35 @@ async def create_deployment_from_git(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DELETE /api/deployments/{deployment_id} — delete deployment + GCP resources
+#  DELETE /api/deployments/{deployment_id} — delete the website it built
 # ═══════════════════════════════════════════════════════════════════════
-
-async def _teardown_resources(record, settings: Settings) -> list[str]:
-    """
-    Release the GCP resources backing one deployment and return any cleanup
-    errors as human-readable warnings.
-
-    Failures are captured rather than raised: the DB record should still go
-    away even when the cloud side is already gone or unreachable, otherwise a
-    half-deleted deployment lingers forever with no way to retry.
-
-    Shared by the single and bulk delete endpoints so both tear down exactly
-    the same things.
-    """
-    deployment_id = record.id
-    mode = record.mode
-    website_name = record.website_name
-    warnings: list[str] = []
-
-    async def _noop_log(message: str) -> None:
-        logger.info("[DELETE %s] %s", deployment_id[:8], message)
-
-    if mode == DeploymentMode.DEMO.value:
-        try:
-            from infra.demo_deployer import DemoDeployer
-            deployer = DemoDeployer(config=settings, log_callback=_noop_log)
-            await deployer.delete(website_name=website_name)
-        except Exception as exc:
-            logger.exception("Failed to delete demo resources for %s", deployment_id)
-            warnings.append(f"Demo cleanup error: {exc}")
-
-    elif mode == DeploymentMode.SUBDOMAIN.value:
-        try:
-            from infra.subdomain_deployer import SubdomainDeployer
-            deployer = SubdomainDeployer(config=settings, log_callback=_noop_log)
-            parent_domain = getattr(record, "domain", None)
-            await deployer.delete(website_name=website_name, parent_domain=parent_domain)
-        except Exception as exc:
-            logger.exception("Failed to delete subdomain resources for %s", deployment_id)
-            warnings.append(f"Subdomain cleanup error: {exc}")
-
-    elif mode == DeploymentMode.CLOUDRUN.value:
-        try:
-            from infra.cloudrun_deployer import CloudRunDeployer
-            deployer = CloudRunDeployer(config=settings, log_callback=_noop_log)
-            await deployer.delete(website_name=website_name)
-        except Exception as exc:
-            logger.exception("Failed to delete Cloud Run resources for %s", deployment_id)
-            warnings.append(f"Cloud Run cleanup error: {exc}")
-
-    elif mode == DeploymentMode.PROD.value:
-        # Prod has too many interdependent resources — flag for manual cleanup
-        logger.info("Prod deployment %s — skipping automatic resource cleanup", deployment_id)
-
-    return warnings
-
 
 @router.delete("/deployments/{deployment_id}", status_code=status.HTTP_200_OK)
 async def delete_deployment(
     deployment_id: str,
+    scope: str = Query(
+        "website", pattern="^(website|record)$",
+        description="'website': the website and everything it owns; 'record': this history entry only",
+    ),
     user=Depends(require_approved),
     db=Depends(get_db),
     settings: Settings = Depends(get_settings),
 ):
     """
-    Delete a deployment and clean up its GCP resources.
+    Delete the website this deployment belongs to (default), or only this
+    history entry.
 
-    Depending on the deployment mode:
-    - **demo**: removes path rule from URL map, backend bucket, storage bucket
-    - **cloudrun**: removes Cloud Run service and Artifact Registry images
-    - **prod**: only deletes the DB record (prod resources require manual cleanup)
+    - ``scope=website`` removes every GCP resource of the website and every
+      one of its deployment records, logs and ZIP backups. If GCP cleanup
+      fails part-way the response is 502 and the website is left in
+      ``delete_failed``; calling again resumes from the failed step.
+    - ``scope=record`` removes just this record (and its logs/backup) and
+      never touches resources — for pruning old or failed runs of a website
+      that stays live. Refused for the live version or the only version.
     """
+    from api.routes.websites import raise_for_outcome, run_deletes
+    from services import website_service as ws
+
     record = crud.get_deployment(db, deployment_id)
     if record is None:
         raise HTTPException(
@@ -582,29 +592,20 @@ async def delete_deployment(
             detail=f"Deployment '{deployment_id}' not found.",
         )
 
-    # Only owner or admin can delete
-    if user.role != UserRole.ADMIN.value:
-        if getattr(record, "deployer_email", "") != getattr(user, "email", ""):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You can only delete your own deployments.",
-            )
+    if scope == "record":
+        try:
+            return await asyncio.to_thread(ws.delete_history_entry, db, settings, deployment_id, user)
+        except LookupError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+        except ws.WebsiteForbidden as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
+        except ws.WebsiteConflict as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
 
-    errors_list = await _teardown_resources(record, settings)
-
-    # Always delete the DB record
-    crud.delete_deployment(db, deployment_id)
-
-    result = {
-        "deleted": True,
-        "deployment_id": deployment_id,
-        "mode": record.mode,
-        "website_name": record.website_name,
-    }
-    if errors_list:
-        result["warnings"] = errors_list
-
-    return result
+    key = ws.key_of(record, settings)
+    result = await run_deletes(db, settings, [key], user)
+    outcome = raise_for_outcome(result["results"][0])
+    return {**outcome, "deleted": True, "deployment_id": deployment_id, "website_key": key}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -719,18 +720,18 @@ def list_deployments(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  POST /api/deployments/bulk-delete — delete a whole selection at once
+#  POST /api/deployments/bulk-delete — preview / delete a selection
 # ═══════════════════════════════════════════════════════════════════════
 
 class BulkDeleteRequest(BaseModel):
     """
-    Either an explicit list of ``ids``, or filters describing a set.
+    Either an explicit list of deployment ``ids``, or filters describing a set.
 
-    ``dry_run`` defaults to True: callers have to ask for the destruction
-    explicitly, and are expected to preview first. A real run must also echo
-    back ``expected_count`` — if the set shifted between preview and execution
-    (a deployment finished, someone else deleted one), the request is refused
-    rather than deleting a different set than the one that was shown.
+    The selection is resolved to *websites*: deleting a deployment deletes
+    the website it built, with all its versions. ``dry_run`` (the default)
+    returns that resolution so the caller can show exactly what goes; the
+    UI then deletes the previewed websites in chunks via
+    ``POST /api/websites/bulk-delete``.
     """
     ids: Optional[list[str]] = Field(
         None, description="Explicit selection; when set, the filters below are ignored",
@@ -743,14 +744,11 @@ class BulkDeleteRequest(BaseModel):
     )
     include_prod: bool = Field(
         False,
-        description=(
-            "Prod deployments leave their IP / load balancer / SSL / DNS behind, "
-            "so they are skipped unless this is explicitly set"
-        ),
+        description="Prod websites are real customer domains — skipped unless explicitly included",
     )
     dry_run: bool = True
     expected_count: Optional[int] = Field(
-        None, description="Required when dry_run is false; must equal the matched count",
+        None, description="Required when dry_run is false; must equal the matched website count",
     )
 
 
@@ -760,8 +758,31 @@ class BulkDeleteMatch(BaseModel):
     mode: str
     status: str
     created_at: Optional[str] = None
+    website_key: Optional[str] = None
     deleted: Optional[bool] = None
     error: Optional[str] = None
+
+
+class WebsitePreview(BaseModel):
+    key: str
+    website_name: str = ""
+    mode: str = ""
+    domain: Optional[str] = None
+    url: Optional[str] = None
+    placement: Optional[str] = None
+    status: str = "active"
+    live: bool = False
+    versions: int = 0
+    matched_ids: list[str] = []
+    deployment_ids: list[str] = []
+    deployers: list[str] = []
+    resources: list[str] = []
+    deletable: bool = True
+    blocked_reason: Optional[str] = None
+    last_delete_error: Optional[str] = None
+    # Set when this one deployment could be removed from history on its
+    # own instead (it is neither the live nor the only version).
+    record_only_allowed: bool = False
 
 
 class BulkDeleteResponse(BaseModel):
@@ -770,6 +791,8 @@ class BulkDeleteResponse(BaseModel):
     deleted_count: int = 0
     failed_count: int = 0
     items: list[BulkDeleteMatch]
+    websites: list[WebsitePreview] = []
+    results: list[dict] = []
     warnings: list[str] = []
 
 
@@ -819,7 +842,8 @@ def _resolve_bulk_targets(db, body: BulkDeleteRequest, deployer_email: Optional[
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Deployment '{deployment_id}' not found.",
                 )
-            if deployer_email is not None and getattr(record, "deployer_email", "") != deployer_email:
+            if deployer_email is not None and \
+                    (getattr(record, "deployer_email", "") or "").casefold() != deployer_email.casefold():
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="You can only delete your own deployments.",
@@ -864,6 +888,53 @@ def _resolve_bulk_targets(db, body: BulkDeleteRequest, deployer_email: Optional[
     )
 
 
+def _website_previews(db, settings: Settings, records: list, user) -> list[WebsitePreview]:
+    from services import website_service as ws
+
+    matched: dict[str, list[str]] = {}
+    for r in records:
+        matched.setdefault(ws.key_of(r, settings), []).append(r.id)
+
+    previews = []
+    for summary in ws.describe_many(db, matched.keys(), settings):
+        key = summary["key"]
+        if not summary.get("exists"):
+            continue
+        blocked = None
+        if summary["deletion_running"]:
+            blocked = "A deletion of this website is already running."
+        elif summary["in_flight"]:
+            blocked = "A deployment of this website is in progress."
+        elif getattr(user, "role", None) != UserRole.ADMIN.value:
+            me = (getattr(user, "email", "") or "").casefold()
+            if any(d.casefold() != me for d in summary["deployers"]):
+                blocked = "Other users deployed to this website — only an admin can delete it."
+        ids = matched[key]
+        previews.append(WebsitePreview(
+            key=key,
+            website_name=summary["website_name"],
+            mode=summary["mode"],
+            domain=summary["domain"],
+            url=summary["url"],
+            placement=summary["placement"],
+            status=summary["status"],
+            live=summary["live"],
+            versions=summary["versions"],
+            matched_ids=ids,
+            deployment_ids=summary["deployment_ids"],
+            deployers=summary["deployers"],
+            resources=summary["resources"],
+            deletable=blocked is None,
+            blocked_reason=blocked,
+            last_delete_error=summary["last_delete_error"],
+            record_only_allowed=(
+                len(ids) == 1 and summary["versions"] > 1
+                and ids[0] != summary["current_deployment_id"]
+            ),
+        ))
+    return previews
+
+
 @router.post("/deployments/bulk-delete", response_model=BulkDeleteResponse)
 async def bulk_delete_deployments(
     body: BulkDeleteRequest,
@@ -872,20 +943,20 @@ async def bulk_delete_deployments(
     settings: Settings = Depends(get_settings),
 ) -> BulkDeleteResponse:
     """
-    Delete several deployments in one call, by explicit selection or by
-    date range and mode.
+    Resolve a selection (explicit ids, or date range + modes) to the websites
+    it would delete, with their versions and resources.
 
-    Call it once with ``dry_run: true`` to see exactly what matches, then again
-    with ``dry_run: false`` and ``expected_count`` set to the number you were
-    shown. Each deployment is torn down individually — one failure is recorded
-    against that deployment and the rest still proceed.
+    ``dry_run: false`` deletes them right away, for selections of up to
+    ``MAX_WEBSITES_PER_REQUEST`` websites with ``expected_count`` equal to
+    the previewed website count; larger selections go through
+    ``POST /api/websites/bulk-delete`` in chunks.
     """
+    from api.routes.websites import MAX_WEBSITES_PER_REQUEST, run_deletes
+
     deployer_email = (
         None if user.role == UserRole.ADMIN.value else getattr(user, "email", "")
     )
-    records = _resolve_bulk_targets(db, body, deployer_email)
-
-    warnings: list[str] = []
+    records = await asyncio.to_thread(_resolve_bulk_targets, db, body, deployer_email)
     if len(records) > MAX_BULK_DELETE:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -895,7 +966,9 @@ async def bulk_delete_deployments(
             ),
         )
 
-    def _describe(record, **extra) -> BulkDeleteMatch:
+    from services import website_service as ws
+
+    def _describe(record) -> BulkDeleteMatch:
         created = getattr(record, "created_at", None)
         return BulkDeleteMatch(
             id=record.id,
@@ -903,81 +976,66 @@ async def bulk_delete_deployments(
             mode=getattr(record, "mode", ""),
             status=getattr(record, "status", ""),
             created_at=created.isoformat() if created else None,
-            **extra,
+            website_key=ws.key_of(record, settings),
         )
 
-    prod_hits = [r for r in records if getattr(r, "mode", "") == DeploymentMode.PROD.value]
-    if prod_hits:
+    websites = await asyncio.to_thread(_website_previews, db, settings, records, user)
+    warnings: list[str] = []
+    extra = sum(w.versions - len(w.matched_ids) for w in websites)
+    if extra > 0:
         warnings.append(
-            f"{len(prod_hits)} prod deployment(s) included — their IP, load balancer, "
-            "SSL certificate and DNS records must still be removed by hand in the "
-            "GCP Console."
+            f"{extra} more deployment record(s) of these websites, outside the selection, "
+            "go too: deleting a website removes all of its versions."
         )
+    prod = [w for w in websites if w.mode == DeploymentMode.PROD.value]
+    if prod:
+        warnings.append(
+            f"{len(prod)} production website(s) included — their domains stop being served "
+            "and their certificates and DNS records are removed."
+        )
+    blocked = [w for w in websites if not w.deletable]
+    if blocked:
+        warnings.append(f"{len(blocked)} website(s) cannot be deleted right now (see each one).")
 
     if body.dry_run:
         return BulkDeleteResponse(
-            dry_run=True,
-            matched=len(records),
-            items=[_describe(r) for r in records],
-            warnings=warnings,
+            dry_run=True, matched=len(records), items=[_describe(r) for r in records],
+            websites=websites, warnings=warnings,
         )
 
+    targets = [w.key for w in websites if w.deletable]
     if body.expected_count is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="expected_count is required when dry_run is false.",
         )
-    if body.expected_count != len(records):
+    if body.expected_count != len(targets):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Selection changed: {len(records)} deployments match now, "
+                f"Selection changed: {len(targets)} websites can be deleted now, "
                 f"but {body.expected_count} were expected. Preview again."
             ),
         )
+    if len(targets) > MAX_WEBSITES_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"{len(targets)} websites selected — delete them in chunks of "
+                f"{MAX_WEBSITES_PER_REQUEST} via POST /api/websites/bulk-delete."
+            ),
+        )
 
-    logger.warning(
-        "Bulk delete of %d deployment(s) requested by %s (concurrency %d)",
-        len(records), getattr(user, "email", "unknown"), BULK_DELETE_CONCURRENCY,
-    )
-
-    semaphore = asyncio.Semaphore(BULK_DELETE_CONCURRENCY)
-
-    async def _delete_one(record) -> BulkDeleteMatch:
-        """Tear down one deployment; never raises, so siblings keep going."""
-        async with semaphore:
-            try:
-                item_warnings = await _teardown_resources(record, settings)
-                # Firestore's client is blocking — off the event loop it goes,
-                # otherwise the concurrency above would be nominal only.
-                await asyncio.to_thread(crud.delete_deployment, db, record.id)
-                return _describe(
-                    record,
-                    deleted=True,
-                    error="; ".join(item_warnings) if item_warnings else None,
-                )
-            except Exception as exc:  # one bad record must not strand the rest
-                logger.exception("Bulk delete failed for %s", record.id)
-                return _describe(record, deleted=False, error=str(exc))
-
-    # gather keeps input order, so the result reads like the preview did.
-    items: list[BulkDeleteMatch] = list(
-        await asyncio.gather(*(_delete_one(r) for r in records))
-    )
-    deleted_count = sum(1 for i in items if i.deleted)
-    failed_count = len(items) - deleted_count
-
-    logger.warning(
-        "Bulk delete finished: %d deleted, %d failed (requested by %s)",
-        deleted_count, failed_count, getattr(user, "email", "unknown"),
-    )
-
+    logger.warning("Bulk delete of %d website(s) requested by %s", len(targets), getattr(user, "email", "?"))
+    result = await run_deletes(db, settings, targets, user)
     return BulkDeleteResponse(
         dry_run=False,
         matched=len(records),
-        deleted_count=deleted_count,
-        failed_count=failed_count,
-        items=items,
+        deleted_count=result["deleted_count"],
+        failed_count=result["failed_count"] + result["blocked_count"],
+        items=[_describe(r) for r in records],
+        websites=websites,
+        results=result["results"],
         warnings=warnings,
     )
 
@@ -986,19 +1044,31 @@ async def bulk_delete_deployments(
 #  GET /api/deployments/{deployment_id} — single deployment detail
 # ═══════════════════════════════════════════════════════════════════════
 
-@router.get("/deployments/{deployment_id}", response_model=DeploymentResponse)
-def get_deployment(
-    deployment_id: str,
-    db = Depends(get_db),
-) -> DeploymentResponse:
-    """Return details for a single deployment."""
+def _get_visible_deployment(db, deployment_id: str, user):
+    """The record, if it exists and the user may see it — admins see every
+    deployment, others their own (the same rule the history list applies)."""
     record = crud.get_deployment(db, deployment_id)
-    if record is None:
+    visible = record is not None and (
+        user.role == UserRole.ADMIN.value
+        or (getattr(record, "deployer_email", "") or "").casefold()
+        == (getattr(user, "email", "") or "").casefold()
+    )
+    if not visible:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Deployment '{deployment_id}' not found.",
         )
-    return DeploymentResponse.from_record(record)
+    return record
+
+
+@router.get("/deployments/{deployment_id}", response_model=DeploymentResponse)
+def get_deployment(
+    deployment_id: str,
+    user=Depends(require_approved),
+    db = Depends(get_db),
+) -> DeploymentResponse:
+    """Return details for a single deployment."""
+    return DeploymentResponse.from_record(_get_visible_deployment(db, deployment_id, user))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1008,16 +1078,11 @@ def get_deployment(
 @router.get("/deployments/{deployment_id}/logs", response_model=list[LogEntry])
 def get_deployment_logs(
     deployment_id: str,
+    user=Depends(require_approved),
     db = Depends(get_db),
 ) -> list[LogEntry]:
     """Return all log entries for a deployment, ordered by timestamp."""
-    # Verify deployment exists
-    record = crud.get_deployment(db, deployment_id)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Deployment '{deployment_id}' not found.",
-        )
+    _get_visible_deployment(db, deployment_id, user)
 
     log_records = crud.get_logs(db, deployment_id)
     return [

@@ -7,14 +7,41 @@ leur architecture reseau/GCP, et les concepts fondamentaux de routing.
 
 ## Vue d'ensemble
 
-La plateforme supporte **4 modes de deploiement** :
+Depuis octobre 2026, **tous les nouveaux sites** passent par un load balancer
+dedie a la plateforme, `webdeploy-sites`. `test-lb` etait plein (URL map plafonnee
+a 64 kB par GCP, 534 regles) et le quota de backend buckets presque epuise
+(569/600). Les sites existants restent sur leur LB d'origine pour que leurs URLs
+ne changent pas ; les sections 1 a 3 ci-dessous decrivent ces placements
+historiques.
 
-| Mode | URL finale | Routing | SSL | Cas d'usage |
-|------|-----------|---------|-----|-------------|
-| **Demo (path-based)** | `digitaldatatest.com/mon-site/` | Path-based | Partage (1 cert) | Tests rapides, previews internes |
-| **Subdomain** | `mon-site.digitaldatatest.com` | Host-based | Wildcard (`*.digitaldatatest.com`) | Sites clients demo avec URL propre |
-| **Production** | `mon-domaine.com` | Host-based | Individuel par domaine | Sites en production avec domaine personnalise |
-| **Cloud Run** | `{service}.run.app` | Gere par GCP | Gere par GCP | Applications backend/fullstack |
+| Mode | URL (nouveau site) | Routage | SSL | Ressources par site |
+|------|--------------------|---------|-----|---------------------|
+| **Demo** | `demo.digitaldatatest.com/mon-site/` | Path-based, bucket **partage** | Wildcard `*.digitaldatatest.com` | Un prefixe `mon-site/` dans le bucket partage |
+| **Production** | `mon-domaine.com` | Host-based | Certificate Manager, un cert par domaine | Bucket, backend bucket, host rule, cert, DNS |
+| **Cloud Run** | `mon-app.digitaldatatest.com` | Host-based → serverless NEG | Wildcard | Service, NEG, backend service, host rule, DNS A |
+
+### LB dedie `webdeploy-sites`
+
+```
+IP webdeploy-sites-ip ──┬── :443 HTTPS proxy ── certificate map
+                        │         │               ├─ PRIMARY + *.digitaldatatest.com → cert wildcard (autorisation DNS)
+                        │         │               └─ mon-domaine.com → cert du domaine (autorisation LB)
+                        │         ▼
+                        │     URL map webdeploy-sites-urlmap
+                        │       ├─ demo.digitaldatatest.com → backend bucket partage → gs://…-webdeploy-demo-sites/{site}/
+                        │       ├─ mon-app.digitaldatatest.com → backend service → NEG serverless → Cloud Run
+                        │       └─ mon-domaine.com → backend bucket du domaine → bucket du domaine
+                        └── :80 → redirection 301 vers HTTPS
+```
+
+Un site demo n'ajoute **rien** a l'URL map ni aux backend buckets : il occupe un
+prefixe d'objets dans le bucket partage, servi par l'unique backend bucket demo.
+Seuls les domaines prod et les apps Cloud Run ajoutent une entree (~150 octets),
+soit plusieurs centaines de sites avant d'approcher la limite de 64 kB.
+
+Le mode **Subdomain** (section 2) n'est plus deployable : le formulaire
+« Subdomain » cree un site Production sur le FQDN compose. Les deux sites
+historiques de ce mode restent supprimables.
 
 ---
 

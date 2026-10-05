@@ -16,13 +16,15 @@ from types import SimpleNamespace
 from typing import Optional, Sequence
 
 from google.cloud.firestore_v1 import Client as FirestoreClient
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from models.enums import DeploymentStatus, LogLevel, PipelineStep, StepStatus, UserStatus
 
 logger = logging.getLogger("webdeploy.crud")
 
 # Collection names
-_DEPLOYMENTS = "deployments"
+DEPLOYMENTS = "deployments"
+_DEPLOYMENTS = DEPLOYMENTS
 _LOGS = "deployment_logs"
 _USERS = "users"
 
@@ -53,6 +55,7 @@ def create_deployment(
     deployer_last_name: str = "",
     deployer_email: str = "",
     ai_enabled: bool = False,
+    website_key: Optional[str] = None,
 ) -> SimpleNamespace:
     initial_steps = {step.value: StepStatus.PENDING.value for step in PipelineStep}
     data = {
@@ -72,6 +75,7 @@ def create_deployment(
         "deployer_email": deployer_email,
         "ai_enabled": ai_enabled,
         "ai_token_usage": None,
+        "website_key": website_key,
         "created_at": datetime.now(timezone.utc),
         "started_at": None,
         "completed_at": None,
@@ -217,17 +221,27 @@ def count_deployments(
 
 
 def delete_deployment(db: FirestoreClient, deployment_id: str) -> bool:
-    """Delete a deployment record and its associated logs."""
+    """Delete a deployment record and its associated logs.
+
+    Logs go first, in batched writes: if the process dies part-way the
+    record survives, so the deletion can still be found and finished.
+    """
     doc_ref = db.collection(_DEPLOYMENTS).document(deployment_id)
-    doc = doc_ref.get()
-    if not doc.exists:
+    logs_query = db.collection(_LOGS).where(
+        filter=FieldFilter("deployment_id", "==", deployment_id)
+    )
+    batch, pending = db.batch(), 0
+    for log_doc in logs_query.select([]).stream():
+        batch.delete(log_doc.reference)
+        pending += 1
+        if pending == 450:  # Firestore caps a batch at 500 writes
+            batch.commit()
+            batch, pending = db.batch(), 0
+    if pending:
+        batch.commit()
+
+    if not doc_ref.get().exists:
         return False
-
-    # Delete associated logs
-    logs_query = db.collection(_LOGS).where("deployment_id", "==", deployment_id)
-    for log_doc in logs_query.stream():
-        log_doc.reference.delete()
-
     doc_ref.delete()
     return True
 

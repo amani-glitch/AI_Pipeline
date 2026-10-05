@@ -107,6 +107,11 @@ class DeploymentResponse(BaseModel):
     storage_bucket: Optional[str] = None
     backend_bucket: Optional[str] = None
     infra_details: Optional[dict] = None
+    website_key: Optional[str] = None
+    placement: Optional[str] = None
+    # Set while the owning website is being deleted, or when that failed.
+    deletion_status: Optional[str] = None
+    deletion_error: Optional[str] = None
     created_at: Optional[datetime]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -141,6 +146,10 @@ class DeploymentResponse(BaseModel):
             storage_bucket=getattr(rec, "storage_bucket", None),
             backend_bucket=getattr(rec, "backend_bucket", None),
             infra_details=getattr(rec, "infra_details", None),
+            website_key=getattr(rec, "website_key", None),
+            placement=(getattr(rec, "infra_details", None) or {}).get("placement"),
+            deletion_status=getattr(rec, "deletion_status", None),
+            deletion_error=getattr(rec, "deletion_error", None),
             created_at=rec.created_at,
             started_at=rec.started_at,
             completed_at=rec.completed_at,
@@ -173,6 +182,12 @@ class PipelineContext(BaseModel):
     cloudrun_service_name: Optional[str] = None
     ai_token_usage: dict = {}
     dns_nameservers: list[str] = []
+    website_key: Optional[str] = None
+    upload_prefix: str = ""
+    cdn_url_map: Optional[str] = None
+    cdn_host: Optional[str] = None
+    cdn_path: Optional[str] = None
+    infra_resources: list[dict] = []
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -208,6 +223,17 @@ class DeploymentResult(BaseModel):
     docker_image: Optional[str] = None
     dns_nameservers: list[str] = []
     error: Optional[str] = None
+    # Where the site's files go: object prefix inside ``storage_bucket``
+    # ("{site}/" for path-routed demo sites, "" for a dedicated bucket).
+    upload_prefix: str = ""
+    placement: Optional[str] = None
+    lb_name: Optional[str] = None
+    # CDN invalidation target after an upload.
+    cdn_url_map: Optional[str] = None
+    cdn_host: Optional[str] = None
+    cdn_path: Optional[str] = None
+    # Informational inventory of what backs the site (shown in the UI).
+    resources: list[dict] = []
 
 
 class LogEntry(BaseModel):
