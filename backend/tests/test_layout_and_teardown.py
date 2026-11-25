@@ -89,6 +89,56 @@ def test_cloudrun_plan(s):
     ]
 
 
+# ── Cloud Run on a custom domain ─────────────────────────────────────────
+
+def test_app_domain_names_cover_apex_and_www(s):
+    d = layout.app_domain_names("api", "mon-app.com", s)
+    assert d.hosts == ["mon-app.com", "www.mon-app.com"]
+    assert set(d.cert_map_entries) == {"mon-app.com", "www.mon-app.com"}
+    assert layout.app_domain_names("api", "api.mon-app.com", s).hosts == ["api.mon-app.com"]
+
+
+def test_app_domain_names_fit_gcp_limits_and_stay_distinct(s):
+    long = layout.app_domain_names("x", "a-very-long-subdomain-for-testing.some-long-domain.co.uk", s)
+    for name in (long.matcher, long.cert, *long.cert_map_entries.values(), long.zone_for_new):
+        assert len(name) <= 63
+    # safe_name() is lossy; the digest keeps look-alike domains apart.
+    a = layout.app_domain_names("x", "my-shop.com", s)
+    b = layout.app_domain_names("x", "my.shop.com", s)
+    assert a.matcher != b.matcher and a.cert != b.cert
+
+
+def test_cloudrun_website_with_a_domain_is_served_there(s):
+    assert layout.public_url(ref("cloudrun", "api", "mon-app.com"), s) == "https://mon-app.com/"
+    # the website key stays the service name — the domain is an attribute
+    assert layout.website_key("cloudrun", "api", "mon-app.com", s) == "cloudrun:api"
+
+
+def test_cloudrun_plan_with_domain_removes_its_front_door(s):
+    plan = teardown.plan_teardown(ref("cloudrun", "api", "mon-app.com"), s)
+    assert actions(plan) == [
+        "url_map.remove_host_route",   # platform host
+        "url_map.remove_host_route",   # custom domain
+        "certmap.delete_entry", "certmap.delete_entry", "certmanager.delete_cert",
+        "backend_service.delete", "neg.delete",
+        "dns.cleanup_host",            # platform host
+        "dns.cleanup_host",            # custom domain
+        "run.delete_service", "ar.delete_package",
+    ]
+    assert len({st.id for st in plan}) == len(plan)  # ids must be unique
+    a = layout.app_names("api", s)
+    domain_route = next(st for st in plan if st.id == "routing-domain")
+    # The custom host is only unrouted while it still points at *our* backend.
+    assert domain_route.params["owned"] == [f"backendServices/{a.backend_service}"]
+    assert domain_route.params["hosts"] == ["mon-app.com", "www.mon-app.com"]
+    assert next(st for st in plan if st.id == "dns-domain").params["domain"] == "mon-app.com"
+
+
+def test_cloudrun_plan_without_domain_touches_no_certificate(s):
+    plan = teardown.plan_teardown(ref("cloudrun", "api"), s)
+    assert not [st for st in plan if "cert" in st.action]
+
+
 # ── executor ─────────────────────────────────────────────────────────────
 
 class FakeOps:

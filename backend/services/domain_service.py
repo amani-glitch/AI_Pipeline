@@ -10,17 +10,22 @@ Checks domain ownership in three ways (in order):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import domains_v1
+from google.type import postal_address_pb2
 from googleapiclient.discovery import build as api_build
 
 from config import Settings
 from infra.gcp_helpers import get_credentials
 
 logger = logging.getLogger("webdeploy.domain_service")
+
+#: Stand-in nameservers used only by ``validate_only`` registrations, which
+#: must send a well-formed DNS configuration without creating a zone.
+_PLACEHOLDER_NS = [f"ns-cloud-a{i}.googledomains.com" for i in (1, 2, 3, 4)]
 
 
 @dataclass
@@ -37,6 +42,11 @@ class DomainRegisterResult:
     """Result of a domain registration attempt."""
     success: bool
     message: str = ""
+    # The Cloud DNS zone the domain was pointed at, and its nameservers.
+    zone_name: str = ""
+    name_servers: list[str] = field(default_factory=list)
+    zone_created: bool = False
+    already_registered: bool = False
 
 
 class DomainService:
@@ -244,42 +254,148 @@ class DomainService:
 
     # ── Register domain ──────────────────────────────────────────────
 
-    def register_domain(self, domain: str) -> DomainRegisterResult:
-        """
-        Purchase/register a domain via Cloud Domains API.
-        Uses WHOIS contact info from settings.
-        """
-        client = self._get_domains_client()
-        settings = self._settings
+    #: WHOIS fields Cloud Domains rejects a registration without.
+    _REQUIRED_CONTACT_FIELDS = (
+        ("DOMAINS_CONTACT_EMAIL", "email"),
+        ("DOMAINS_CONTACT_PHONE", "téléphone"),
+        ("DOMAINS_CONTACT_COUNTRY", "pays"),
+        ("DOMAINS_CONTACT_CITY", "ville"),
+        ("DOMAINS_CONTACT_ADDRESS", "adresse"),
+        ("DOMAINS_CONTACT_POSTAL_CODE", "code postal"),
+    )
 
-        # Build contact info from settings
+    def missing_contact_fields(self) -> list[str]:
+        """WHOIS contact settings that are not configured.
+
+        Checked before anything is bought: a registration that reaches the
+        API with an incomplete contact is rejected *after* the order, which
+        used to surface as an opaque ``InvalidArgument``.
+        """
+        return [
+            label for key, label in self._REQUIRED_CONTACT_FIELDS
+            if not str(getattr(self._settings, key, "") or "").strip()
+        ]
+
+    def _contact_settings(self) -> domains_v1.ContactSettings:
+        """The registrant/admin/technical contact written into WHOIS."""
+        s = self._settings
+        recipient = (s.DOMAINS_CONTACT_NAME or s.DOMAINS_CONTACT_COMPANY or "").strip()
         contact = domains_v1.ContactSettings.Contact(
-            postal_address=domains_v1.types.PostalAddress(
-                region_code=settings.DOMAINS_CONTACT_COUNTRY,
-                administrative_area=settings.DOMAINS_CONTACT_STATE,
-                locality=settings.DOMAINS_CONTACT_CITY,
-                address_lines=[settings.DOMAINS_CONTACT_ADDRESS] if settings.DOMAINS_CONTACT_ADDRESS else [],
-                postal_code=settings.DOMAINS_CONTACT_POSTAL_CODE,
-                organization=settings.DOMAINS_CONTACT_COMPANY,
-                recipients=[settings.DOMAINS_CONTACT_EMAIL],
+            postal_address=postal_address_pb2.PostalAddress(
+                region_code=s.DOMAINS_CONTACT_COUNTRY,
+                administrative_area=s.DOMAINS_CONTACT_STATE,
+                locality=s.DOMAINS_CONTACT_CITY,
+                address_lines=[s.DOMAINS_CONTACT_ADDRESS] if s.DOMAINS_CONTACT_ADDRESS else [],
+                postal_code=s.DOMAINS_CONTACT_POSTAL_CODE,
+                organization=s.DOMAINS_CONTACT_COMPANY,
+                # WHOIS wants a person or entity name here, not an email
+                # address: registries reject (or publish) a mailbox as the
+                # addressee.
+                recipients=[recipient] if recipient else [],
             ),
-            email=settings.DOMAINS_CONTACT_EMAIL,
-            phone_number=settings.DOMAINS_CONTACT_PHONE,
+            email=s.DOMAINS_CONTACT_EMAIL,
+            phone_number=s.DOMAINS_CONTACT_PHONE,
         )
-
-        contact_settings = domains_v1.ContactSettings(
-            privacy=domains_v1.ContactPrivacy.REDACTED_CONTACT_DATA,
+        privacy = getattr(
+            domains_v1.ContactPrivacy,
+            (s.DOMAINS_CONTACT_PRIVACY or "REDACTED_CONTACT_DATA").strip().upper(),
+            domains_v1.ContactPrivacy.REDACTED_CONTACT_DATA,
+        )
+        return domains_v1.ContactSettings(
+            privacy=privacy,
             registrant_contact=contact,
             admin_contact=contact,
             technical_contact=contact,
         )
 
-        # Get yearly price from availability check
+    def _register_parameters(self, domain: str):
+        """``RegisterParameters`` for *domain* (price, availability, notices)."""
+        client = self._get_domains_client()
+        response = client.search_domains(query=domain, location=self._parent)
+        for params in response.register_parameters:
+            if params.domain_name == domain:
+                return params
+        return None
+
+    def _existing_zone_nameservers(self, domain: str) -> list[str]:
+        """Nameservers of the zone already serving *domain*, if any."""
+        from infra import dns_ops
+
+        try:
+            dns = self._get_dns_service()
+            zone = dns_ops.find_zone_for(dns, self._project, domain)
+            if zone is None:
+                return []
+            return dns_ops.zone_nameservers(dns, self._project, zone["name"])
+        except Exception as exc:
+            logger.warning("Could not read nameservers for %s: %s", domain, exc)
+            return []
+
+    def ensure_dns_zone(self, domain: str) -> tuple[str, list[str], bool]:
+        """Get or create the Cloud DNS zone that will serve *domain*.
+
+        Returns ``(zone_name, nameservers, created)``. The zone is created
+        **before** the domain is bought so the registration can carry this
+        zone's real nameservers; Google spreads zones over four
+        ``ns-cloud-{a..f}`` sets, so a hard-coded set resolves nothing.
+        """
+        from infra import dns_ops
+        from infra.gcp_helpers import bounded_name, safe_name
+
+        dns = self._get_dns_service()
+        zone_name_for_new = bounded_name(f"{safe_name(domain)}-zone")
+        zone, nameservers, created = dns_ops.ensure_zone_for_domain(
+            dns, self._project, domain, zone_name_for_new,
+        )
+        return zone["name"], nameservers, created
+
+    def register_domain(
+        self,
+        domain: str,
+        *,
+        name_servers: Optional[list[str]] = None,
+        validate_only: bool = False,
+        log=lambda msg: None,
+    ) -> DomainRegisterResult:
+        """Buy *domain* through Cloud Domains and point it at Cloud DNS.
+
+        A Cloud DNS zone for the domain is created first (unless one exists,
+        or ``name_servers`` is supplied) and the registration is submitted
+        with that zone's nameservers, so the domain resolves through this
+        project as soon as it is active.
+
+        With ``validate_only`` nothing is created or bought: Cloud Domains
+        validates the contact settings, notices and price and returns, which
+        is how the flow is exercised end to end without spending money.
+        """
+        missing = self.missing_contact_fields()
+        if missing:
+            return DomainRegisterResult(
+                success=False,
+                message=(
+                    "Coordonnées WHOIS incomplètes — impossible d'acheter un domaine. "
+                    f"Champs manquants: {', '.join(missing)}."
+                ),
+            )
+
+        # Already ours? Nothing to buy — but the DNS zone must still exist.
         check_result = self.check_domain(domain)
         if check_result.status == "owned":
+            if validate_only:
+                return DomainRegisterResult(
+                    success=True,
+                    message=f"Domaine {domain} déjà enregistré — aucun achat nécessaire.",
+                    name_servers=self._existing_zone_nameservers(domain),
+                    already_registered=True,
+                )
+            zone_name, nameservers, created = self.ensure_dns_zone(domain)
             return DomainRegisterResult(
                 success=True,
                 message=f"Domaine {domain} déjà enregistré — aucun achat nécessaire.",
+                zone_name=zone_name,
+                name_servers=nameservers if created else [],
+                zone_created=created,
+                already_registered=True,
             )
         if check_result.status != "available":
             return DomainRegisterResult(
@@ -288,51 +404,91 @@ class DomainService:
             )
 
         try:
-            # Retrieve register parameters for the yearly price
-            response = client.search_domains(
-                query=domain,
-                location=self._parent,
-            )
-
-            yearly_price = None
-            for result in response.register_parameters:
-                if result.domain_name == domain:
-                    yearly_price = result.yearly_price
-                    break
-
-            if yearly_price is None:
+            params = self._register_parameters(domain)
+            if params is None or params.yearly_price is None:
                 return DomainRegisterResult(
                     success=False,
                     message=f"Impossible de déterminer le prix pour {domain}.",
+                )
+
+            zone_created = False
+            zone_name = ""
+            if name_servers:
+                nameservers = list(name_servers)
+            elif validate_only:
+                # A dry run creates nothing, so reuse an existing zone's
+                # nameservers or stand in Google's default set for the
+                # validation call only.
+                nameservers = self._existing_zone_nameservers(domain) or _PLACEHOLDER_NS
+            else:
+                zone_name, nameservers, zone_created = self.ensure_dns_zone(domain)
+                log(f"Zone DNS {zone_name} {'créée' if zone_created else 'réutilisée'} pour {domain}")
+            if not nameservers:
+                return DomainRegisterResult(
+                    success=False,
+                    message=f"Zone DNS sans serveurs de noms pour {domain} — achat annulé.",
                 )
 
             registration = domains_v1.Registration(
                 name=f"{self._parent}/registrations/{domain}",
                 domain_name=domain,
                 dns_settings=domains_v1.DnsSettings(
-                    custom_dns=domains_v1.DnsSettings.CustomDns(
-                        name_servers=["ns-cloud-a1.googledomains.com",
-                                      "ns-cloud-a2.googledomains.com",
-                                      "ns-cloud-a3.googledomains.com",
-                                      "ns-cloud-a4.googledomains.com"],
-                    ),
+                    custom_dns=domains_v1.DnsSettings.CustomDns(name_servers=nameservers),
                 ),
-                contact_settings=contact_settings,
+                contact_settings=self._contact_settings(),
+                labels={"managed-by": "webdeploy"},
             )
 
-            operation = client.register_domain(
-                parent=self._parent,
-                registration=registration,
-                yearly_price=yearly_price,
+            price = params.yearly_price
+            amount = price.units + price.nanos / 1e9
+            log(
+                f"Achat de {domain} — {amount:.2f} {price.currency_code}/an, "
+                f"serveurs de noms: {', '.join(nameservers)}"
             )
+
+            operation = self._get_domains_client().register_domain(
+                request=domains_v1.RegisterDomainRequest(
+                    parent=self._parent,
+                    registration=registration,
+                    # Notices the registry requires for this TLD (e.g. the
+                    # HSTS-preload notice on .app/.dev) — omitting one is a
+                    # hard rejection.
+                    domain_notices=list(params.domain_notices),
+                    contact_notices=(
+                        [domains_v1.ContactNotice.PUBLIC_CONTACT_DATA_ACKNOWLEDGEMENT]
+                        if registration.contact_settings.privacy
+                        == domains_v1.ContactPrivacy.PUBLIC_CONTACT_DATA
+                        else []
+                    ),
+                    yearly_price=price,
+                    validate_only=validate_only,
+                )
+            )
+
+            if validate_only:
+                logger.info("Domain registration for %s validated (dry run)", domain)
+                return DomainRegisterResult(
+                    success=True,
+                    message=(
+                        f"Validation réussie pour {domain} — {amount:.2f} "
+                        f"{price.currency_code}/an (aucun achat effectué)."
+                    ),
+                    name_servers=nameservers,
+                )
 
             logger.info("Domain registration started for %s — waiting for completion...", domain)
-            operation.result(timeout=300)  # Wait up to 5 minutes
+            operation.result(timeout=600)  # registries can take a few minutes
 
             logger.info("Domain %s registered successfully!", domain)
             return DomainRegisterResult(
                 success=True,
-                message=f"Domaine {domain} acheté avec succès!",
+                message=(
+                    f"Domaine {domain} acheté avec succès "
+                    f"({amount:.2f} {price.currency_code}/an)."
+                ),
+                zone_name=zone_name,
+                name_servers=nameservers,
+                zone_created=zone_created,
             )
 
         except Exception as exc:

@@ -45,6 +45,7 @@ from infra.layout import (
     Placement,
     SitesNames,
     WebsiteRef,
+    app_domain_names,
     app_names,
     demo_prefix,
     legacy_demo_names,
@@ -129,6 +130,24 @@ def plan_teardown(ref: WebsiteRef, s: Settings) -> list[Step]:
                  {"name": a.neg, "region": a.region}, f"Serverless NEG {a.neg}"))
         add(Step("dns", DNS, "dns.cleanup_host",
                  {"domain": a.host, "address": n.ip}, f"DNS record {a.host}", hosts=(a.host,)))
+        if ref.domain:
+            # The website also serves its own domain: its host rule,
+            # certificate and DNS records are named after the domain.
+            d = app_domain_names(ref.website_name, ref.domain, s)
+            hosts = tuple(d.hosts)
+            add(Step("routing-domain", ROUTING + 1, "url_map.remove_host_route",
+                     {"url_map": n.url_map, "hosts": list(hosts),
+                      "owned": [url_map_ops.backend_service_key(a.backend_service)]},
+                     f"Host rule {', '.join(hosts)} on {n.url_map}"))
+            for host, entry in d.cert_map_entries.items():
+                add(Step(f"cert-entry:{host}", CERTS, "certmap.delete_entry",
+                         {"map": n.cert_map, "entry": entry},
+                         f"Certificate map entry {host}", hosts=(host,)))
+            add(Step("cert", CERTS + 1, "certmanager.delete_cert", {"name": d.cert},
+                     f"Certificate {d.cert}", hosts=hosts))
+            add(Step("dns-domain", DNS + 1, "dns.cleanup_host",
+                     {"domain": ref.domain, "address": n.ip},
+                     f"DNS records {ref.domain}", hosts=hosts))
         add(Step("cloud-run", COMPUTE, "run.delete_service",
                  {"name": a.service, "region": a.region}, f"Cloud Run service {a.service}"))
         add(Step("images", COMPUTE + 1, "ar.delete_package",

@@ -48,6 +48,9 @@ def check_domain(
     Check if a domain is already owned in the GCP project, available
     for purchase, or unavailable.
 
+    Used by both deployment modes that can own a domain: prod (static site
+    on a bucket) and cloudrun (container behind the load balancer).
+
     When PROD_AUTO_REGISTER_DOMAINS is disabled, always returns "owned"
     so deployment is not blocked.
     """

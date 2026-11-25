@@ -127,6 +127,13 @@ export default function DeploymentForm() {
       ? `${subdomainLabel.trim()}.${parentDomain.trim()}`
       : "";
 
+  // Modes whose website can own a real domain: prod (static site on a
+  // bucket), subdomain (composed FQDN) and cloudrun (container behind the
+  // load balancer). For Cloud Run the domain is optional — without one the
+  // site is served on {name}.digitaldatatest.com.
+  const modeTakesDomain =
+    mode === "prod" || mode === "subdomain" || mode === "cloudrun";
+
   // The domain to validate depends on the mode
   const effectiveDomain =
     mode === "subdomain" ? composedSubdomainFqdn : domain.trim();
@@ -142,7 +149,7 @@ export default function DeploymentForm() {
       clearTimeout(domainCheckTimer.current);
     }
 
-    if (mode !== "prod" && mode !== "subdomain") {
+    if (!modeTakesDomain) {
       return;
     }
 
@@ -173,12 +180,13 @@ export default function DeploymentForm() {
         clearTimeout(domainCheckTimer.current);
       }
     };
-  }, [effectiveDomain, mode]);
+  }, [effectiveDomain, mode, modeTakesDomain]);
 
   // ── Which website this deploy targets: new, or an update of an existing one ──
   const [siteInfo, setSiteInfo] = useState(null);
   const lookupBackendMode = mode === "subdomain" ? "prod" : mode;
-  const lookupDomain = mode === "subdomain" ? composedSubdomainFqdn : mode === "prod" ? domain.trim() : "";
+  const lookupDomain =
+    mode === "subdomain" ? composedSubdomainFqdn : mode === "prod" ? domain.trim() : "";
   useEffect(() => {
     setSiteInfo(null);
     const name = websiteName.trim();
@@ -218,7 +226,8 @@ export default function DeploymentForm() {
   // "checking" is allowed so the deploy button isn't blocked while the API responds
   // — the backend validates domain ownership independently.
   const domainValid =
-    (mode !== "prod" && mode !== "subdomain") ||
+    !modeTakesDomain ||
+    (mode === "cloudrun" && !domain.trim()) ||
     domainStatus === null ||
     domainStatus === "checking" ||
     domainStatus === "owned" ||
@@ -299,7 +308,7 @@ export default function DeploymentForm() {
       const backendDomain =
         mode === "subdomain"
           ? composedSubdomainFqdn
-          : mode === "prod"
+          : mode === "prod" || mode === "cloudrun"
             ? domain.trim()
             : "";
 
@@ -546,7 +555,7 @@ export default function DeploymentForm() {
                   >
                     Cloud Run
                     <span className="block text-xs font-normal mt-0.5 opacity-80">
-                      Deploy any app
+                      App + vrai domaine
                     </span>
                   </button>
                 </>
@@ -786,6 +795,118 @@ export default function DeploymentForm() {
                   utilisez plut&ocirc;t le mode Production pour l&apos;acheter.
                 </div>
               )}
+            </div>
+          )}
+
+          {/* Cloud Run mode — optional real domain for the container */}
+          {mode === "cloudrun" && (
+            <div className="space-y-3">
+              <div>
+                <label
+                  htmlFor="cloudrun-domain"
+                  className="block text-sm font-medium text-gray-700 mb-1"
+                >
+                  Domaine personnalis&eacute;{" "}
+                  <span className="text-gray-400 font-normal">(optionnel)</span>
+                </label>
+                <input
+                  id="cloudrun-domain"
+                  type="text"
+                  value={domain}
+                  onChange={(e) => setDomain(e.target.value.trim().toLowerCase())}
+                  placeholder="mon-app.com ou api.mon-app.com"
+                  className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
+                    focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent
+                    placeholder-gray-400"
+                />
+                <p className="mt-1 text-xs text-gray-500">
+                  Sans domaine, l&apos;app est servie sur{" "}
+                  <span className="font-mono">
+                    {(websiteName.trim() || "mon-app")}.digitaldatatest.com
+                  </span>
+                  . Avec un domaine, elle est servie sur les deux.
+                </p>
+              </div>
+
+              {/* Domain status indicator */}
+              {domain.trim() && domainStatus === "checking" && (
+                <div className="flex items-center gap-2 text-sm text-gray-500">
+                  <Loader className="w-4 h-4 animate-spin" />
+                  V&eacute;rification du domaine...
+                </div>
+              )}
+              {domain.trim() && domainStatus === "owned" && (
+                <div className="flex items-center gap-2 text-sm text-emerald-600">
+                  <CheckCircle className="w-4 h-4" />
+                  Domaine d&eacute;j&agrave; enregistr&eacute; dans le projet GCP
+                </div>
+              )}
+              {domain.trim() && domainStatus === "available" && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-sm text-amber-600">
+                    <AlertTriangle className="w-4 h-4" />
+                    Attention, on va acheter ce domaine &mdash; {domainPrice}
+                  </div>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={domainPurchaseConfirmed}
+                      onChange={(e) => setDomainPurchaseConfirmed(e.target.checked)}
+                      className="h-4 w-4 rounded border-gray-300 text-amber-600 focus:ring-amber-500"
+                    />
+                    <span className="text-sm text-gray-700">
+                      Je confirme l&apos;achat de ce domaine
+                    </span>
+                  </label>
+                </div>
+              )}
+              {domain.trim() && domainStatus === "external" && (
+                <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                  <div className="flex items-center gap-2 text-sm text-blue-700">
+                    <Info className="w-4 h-4 flex-shrink-0" />
+                    Domaine enregistr&eacute; chez un registrar externe (GoDaddy, OVH, etc.)
+                  </div>
+                  <p className="mt-1.5 text-xs text-blue-600 ml-6">
+                    Le d&eacute;ploiement cr&eacute;e la zone Cloud DNS&nbsp;; changez ensuite les
+                    nameservers chez le registrar (ils seront affich&eacute;s dans les logs).
+                  </p>
+                </div>
+              )}
+
+              <div className="p-4 bg-teal-50 border border-teal-200 rounded-lg">
+                <h4 className="text-sm font-semibold text-teal-800 mb-2">
+                  Ressources provisionnees automatiquement
+                </h4>
+                <ul className="space-y-1.5 text-xs text-teal-700">
+                  <li className="flex items-start gap-2">
+                    <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span><strong>Image Docker</strong> (Cloud Build) + service <strong>Cloud Run</strong> public</span>
+                  </li>
+                  <li className="flex items-start gap-2">
+                    <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span><strong>NEG serverless</strong> regional + <strong>backend service</strong> sur le Load Balancer</span>
+                  </li>
+                  {domain.trim() && (
+                    <>
+                      <li className="flex items-start gap-2">
+                        <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                        <span>
+                          <strong>Enregistrement du domaine</strong> via Cloud Domains
+                          (si disponible et confirme) + <strong>zone Cloud DNS</strong>
+                        </span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                        <span>
+                          <strong>Certificat SSL</strong> Google-managed pour{" "}
+                          <span className="font-mono">{domain.trim()}</span>
+                          {" "}(jusqu&apos;a 1h de provisionnement)
+                        </span>
+                      </li>
+                    </>
+                  )}
+                </ul>
+              </div>
             </div>
           )}
 

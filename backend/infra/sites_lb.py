@@ -7,6 +7,7 @@ The dedicated platform load balancer ("sites LB").
                 │              ▼
                 │           URL map ── host {demo host} ─► shared demo backend bucket ─► gs://…-demo-sites/{site}/…
                 │                    ├─ host {app}.{apps}  ─► backend service ─► serverless NEG ─► Cloud Run
+                │                    ├─ host {app domain}  ─► the same backend service (custom domain)
                 │                    └─ host {prod domain} ─► per-domain backend bucket ─► per-domain bucket
                 └── :80   HTTP proxy ── redirect URL map (301 → https)
 
@@ -16,6 +17,13 @@ bucket (project quota 600 — 569 were in use). Serving every demo site from
 one backend bucket, under its own object prefix, means a new demo site
 touches neither: no URL map change, no new backend resource. The URL map only
 grows for prod domains and Cloud Run apps, which are rare.
+
+A Cloud Run website can additionally be served on a real domain: the same
+serverless NEG and backend service gain a second host rule, a Google-managed
+certificate of their own (the wildcard covers ``*.{apps domain}`` only) and
+DNS records pointing the domain at this LB. The platform hostname stays
+routed next to it, so the site has a working URL while that certificate
+provisions.
 
 ``SitesLB.provision()`` builds the shared part once (idempotent; run via
 ``scripts/provision_sites_lb.py``). The ``deploy_*`` / ``expose_*`` methods
@@ -42,6 +50,7 @@ from infra.gcp_helpers import (
 from infra.layout import (
     Placement,
     SitesNames,
+    app_domain_names,
     app_names,
     demo_prefix,
     normalize_domain,
@@ -196,8 +205,18 @@ class SitesLB:
             ],
         )
 
-    def expose_cloud_run(self, website_name: str) -> dict:
-        """Put a deployed Cloud Run service behind the LB at {app}.{apps domain}."""
+    def expose_cloud_run(self, website_name: str, domain: Optional[str] = None) -> dict:
+        """Put a deployed Cloud Run service behind the LB.
+
+        Always at the platform host ``{app}.{apps domain}`` (covered by the
+        wildcard certificate, so it serves immediately), and additionally on
+        ``domain`` when the website has one of its own. Both hosts route to
+        the same serverless NEG, so the container is deployed once.
+
+        Returns ``url`` (the site's public address — the custom domain when
+        there is one), ``platform_url``, the resource inventory and any
+        nameservers a newly created DNS zone needs at the registrar.
+        """
         names = app_names(website_name, self.s)
         ip = self.ip()
 
@@ -219,14 +238,69 @@ class SitesLB:
         self._route_hosts([names.host], names.matcher, bes_link)
         dns_ops.ensure_record(self.dns, self.project, self.n.dns_zone, names.host, "A", [ip])
         self.log(f"[INFRA] https://{names.host}/ → Cloud Run '{names.service}' (wildcard certificate)")
-        return {
-            "url": f"https://{names.host}/",
+
+        platform_url = f"https://{names.host}/"
+        result = {
+            "url": platform_url,
+            "platform_url": platform_url,
+            "dns_nameservers": [],
             "resources": [
                 {"kind": "cloud_run_service", "name": names.service},
                 {"kind": "serverless_neg", "name": names.neg},
                 {"kind": "backend_service", "name": names.backend_service},
                 {"kind": "host_rule", "name": names.host, "url_map": self.n.url_map},
                 {"kind": "dns", "name": names.host, "ip": ip},
+            ],
+        }
+
+        domain = normalize_domain(domain)
+        if domain:
+            custom = self.attach_app_domain(website_name, domain, bes_link, ip)
+            result["url"] = custom["url"]
+            result["dns_nameservers"] = custom["dns_nameservers"]
+            result["resources"].extend(custom["resources"])
+        return result
+
+    def attach_app_domain(
+        self, website_name: str, domain: str, service_link: str, ip: str,
+    ) -> dict:
+        """Serve a Cloud Run website on its own domain.
+
+        Adds the host rule, a Google-managed certificate for the domain (the
+        LB's wildcard only covers ``*.{apps domain}``) and the DNS records
+        that point it at the LB. Idempotent, like everything else here.
+        """
+        d = app_domain_names(website_name, domain, self.s)
+        self.log(f"[INFRA] Custom domain {', '.join(d.hosts)} → Cloud Run (IP {ip})")
+
+        self._route_hosts(d.hosts, d.matcher, service_link)
+
+        self.certs.ensure_managed_cert(d.cert, d.hosts)
+        for host, entry in d.cert_map_entries.items():
+            self.certs.ensure_map_entry(self.n.cert_map, entry, d.cert, hostname=host)
+        self.log(
+            f"[INFRA] Certificate {d.cert} for {', '.join(d.hosts)} "
+            "(Google provisions it once DNS points at the LB; can take up to an hour)"
+        )
+
+        nameservers: list[str] = []
+        if self.s.PROD_AUTO_CREATE_DNS_ZONE:
+            nameservers = dns_ops.ensure_host_records(
+                self.dns, self.project, domain, ip,
+                zone_name_for_new=d.zone_for_new, allow_create_zone=True, log=self.log,
+            )
+        else:
+            self.log(f"[INFRA] ACTION REQUIRED: point {', '.join(d.hosts)} at {ip} (A record)")
+        if nameservers:
+            self.log(f"[INFRA] Set these nameservers at the registrar: {', '.join(nameservers)}")
+
+        return {
+            "url": f"https://{domain}/",
+            "dns_nameservers": nameservers,
+            "resources": [
+                {"kind": "host_rule", "name": ", ".join(d.hosts), "url_map": self.n.url_map},
+                {"kind": "certificate", "name": d.cert},
+                {"kind": "dns", "name": domain, "ip": ip},
             ],
         }
 

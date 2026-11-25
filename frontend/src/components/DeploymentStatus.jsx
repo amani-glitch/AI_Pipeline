@@ -457,7 +457,8 @@ export default function DeploymentStatus({ deployment }) {
               )}
 
               {/* SSL */}
-              {deployment.mode === "prod" && deployment.infra_details?.ssl_cert_created && (
+              {(deployment.mode === "prod" || (deployment.mode === "cloudrun" && deployment.domain)) &&
+                deployment.infra_details?.ssl_cert_created && (
                 <div className="flex items-start gap-3">
                   <Shield className="w-4 h-4 text-green-500 mt-0.5 flex-shrink-0" />
                   <div>
@@ -466,6 +467,31 @@ export default function DeploymentStatus({ deployment }) {
                       Google-managed
                       <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-100 text-green-700">
                         Auto-provisionne
+                      </span>
+                    </dd>
+                  </div>
+                </div>
+              )}
+
+              {/* Platform hostname, kept routed next to a custom domain */}
+              {deployment.infra_details?.platform_url && (
+                <div className="flex items-start gap-3">
+                  <Globe className="w-4 h-4 text-teal-500 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <dt className="text-xs text-gray-500 uppercase tracking-wide">
+                      URL plateforme
+                    </dt>
+                    <dd className="text-sm font-mono font-medium text-gray-900 break-all">
+                      <a
+                        href={deployment.infra_details.platform_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="hover:underline"
+                      >
+                        {deployment.infra_details.platform_url}
+                      </a>
+                      <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-teal-100 text-teal-700">
+                        Disponible immediatement
                       </span>
                     </dd>
                   </div>

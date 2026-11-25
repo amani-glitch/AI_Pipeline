@@ -142,12 +142,17 @@ class PipelineOrchestrator:
                     )
                     continue
 
-                # ── DOMAIN_REGISTER: skip unless prod + confirmed + enabled ──
+                # ── DOMAIN_REGISTER: skip unless a domain is to be bought ──
+                # Both prod (static site on a bucket) and Cloud Run websites
+                # can own a real domain, so the step is gated on the domain
+                # and the user's confirmation, not on the mode.
                 if step == PipelineStep.DOMAIN_REGISTER:
-                    is_prod = ctx.config.mode == DeploymentMode.PROD
+                    buys_domain = ctx.config.mode in (
+                        DeploymentMode.PROD, DeploymentMode.CLOUDRUN,
+                    ) and bool(ctx.config.domain)
                     auto_register = self._settings.PROD_AUTO_REGISTER_DOMAINS
                     confirmed = ctx.config.domain_purchase_confirmed
-                    if not (is_prod and auto_register and confirmed):
+                    if not (buys_domain and auto_register and confirmed):
                         crud.update_step_status(
                             db, deployment_id, step.value, StepStatus.SKIPPED.value,
                         )
@@ -383,16 +388,19 @@ class PipelineOrchestrator:
         )
 
     async def _step_build(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        # Mode first: a Cloud Run website is served by a container even when
+        # its sources are plain HTML (the Dockerfile generator falls back to
+        # nginx), so it still needs a BUILD step.
+        if ctx.config.mode == DeploymentMode.CLOUDRUN:
+            await self._step_build_cloudrun(ctx, log_cb)
+            return
+
         if ctx.is_static:
             log_cb(
                 "Static HTML site — skipping build (no npm install/build needed)",
                 level=LogLevel.INFO.value,
                 step=PipelineStep.BUILD.value,
             )
-            return
-
-        if ctx.config.mode == DeploymentMode.CLOUDRUN:
-            await self._step_build_cloudrun(ctx, log_cb)
             return
 
         from services.build_service import BuildService
@@ -445,6 +453,10 @@ class PipelineOrchestrator:
         )
 
     async def _step_verify(self, ctx: PipelineContext, log_cb: Callable) -> None:
+        if ctx.config.mode == DeploymentMode.CLOUDRUN:
+            await self._step_verify_cloudrun(ctx, log_cb)
+            return
+
         if ctx.is_static:
             # For static sites, verify main HTML file exists in dist_path
             import os
@@ -456,10 +468,6 @@ class PipelineOrchestrator:
                 level=LogLevel.INFO.value,
                 step=PipelineStep.VERIFY.value,
             )
-            return
-
-        if ctx.config.mode == DeploymentMode.CLOUDRUN:
-            await self._step_verify_cloudrun(ctx, log_cb)
             return
 
         from services.build_service import BuildService
@@ -505,17 +513,28 @@ class PipelineOrchestrator:
             step=PipelineStep.DOMAIN_REGISTER.value,
         )
 
+        def _log(message: str) -> None:
+            log_cb(
+                message,
+                level=LogLevel.INFO.value,
+                step=PipelineStep.DOMAIN_REGISTER.value,
+            )
+
         service = DomainService(self._settings)
-        result = await asyncio.to_thread(service.register_domain, domain)
+        result = await asyncio.to_thread(
+            lambda: service.register_domain(domain, log=_log)
+        )
 
         if not result.success:
             raise RuntimeError(result.message)
 
-        log_cb(
-            result.message,
-            level=LogLevel.INFO.value,
-            step=PipelineStep.DOMAIN_REGISTER.value,
-        )
+        # The zone was created here, before the domain was bought, so the
+        # registration carries its real nameservers. INFRA only adds records
+        # to it, and so reports none — keep them for the UI and the email.
+        if result.name_servers:
+            ctx.dns_nameservers = result.name_servers
+
+        _log(result.message)
 
     async def _step_infra(self, ctx: PipelineContext, log_cb: Callable) -> None:
         """Provision (or reuse) the website's infrastructure.
@@ -566,6 +585,7 @@ class PipelineOrchestrator:
         _log(f"[INFRA] Website {ctx.website_key} — placement: {placement.value}")
 
         run_app_url = None
+        platform_url = None
         if cfg.mode == DeploymentMode.DEMO and placement == Placement.LEGACY_DEMO:
             from infra.demo_deployer import DemoDeployer
             result = await DemoDeployer(config=settings, log_callback=_async_log).deploy(
@@ -614,10 +634,14 @@ class PipelineOrchestrator:
             if result.success:
                 run_app_url = result.url
                 exposure = await asyncio.to_thread(
-                    lambda: SitesLB(settings, log=_log).expose_cloud_run(cfg.website_name)
+                    lambda: SitesLB(settings, log=_log).expose_cloud_run(
+                        cfg.website_name, cfg.domain,
+                    )
                 )
                 result.url = exposure["url"]
                 result.resources = exposure["resources"]
+                result.dns_nameservers = exposure["dns_nameservers"]
+                platform_url = exposure["platform_url"]
                 result.placement, result.lb_name = Placement.SITES.value, SitesLB.lb_name(settings)
 
         else:
@@ -638,6 +662,9 @@ class PipelineOrchestrator:
             Placement.LEGACY_PROD: settings.PROD_URL_MAP_NAME,
         }.get(placement)
         is_prod = cfg.mode == DeploymentMode.PROD
+        # A Cloud Run website with its own domain gets the same per-domain
+        # certificate and DNS zone a prod website does.
+        owns_domain = is_prod or (cfg.mode == DeploymentMode.CLOUDRUN and bool(cfg.domain))
         infra_update: dict = {
             "storage_bucket": result.storage_bucket or "",
             "backend_bucket": result.backend_bucket or "",
@@ -646,10 +673,16 @@ class PipelineOrchestrator:
                 "placement": placement.value,
                 "lb_name": lb_name,
                 "upload_prefix": result.upload_prefix,
-                "ssl_cert_created": bool(is_prod and (placement == Placement.SITES or settings.PROD_AUTO_CREATE_SSL_CERT)),
-                "dns_zone_created": bool(is_prod and settings.PROD_AUTO_CREATE_DNS_ZONE),
+                "ssl_cert_created": bool(
+                    owns_domain and (placement == Placement.SITES or settings.PROD_AUTO_CREATE_SSL_CERT)
+                ),
+                "dns_zone_created": bool(owns_domain and settings.PROD_AUTO_CREATE_DNS_ZONE),
                 "cdn_enabled": cfg.mode != DeploymentMode.CLOUDRUN,
                 "run_app_url": run_app_url,
+                # The {app}.{apps domain} address, kept routed alongside a
+                # custom domain so the site is reachable while the custom
+                # domain's certificate provisions.
+                "platform_url": platform_url,
                 "resources": result.resources,
             },
         }

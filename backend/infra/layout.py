@@ -213,6 +213,41 @@ def app_names(website_name: str, s: Settings) -> AppNames:
     )
 
 
+@dataclass(frozen=True)
+class AppDomainNames:
+    """A Cloud Run website's own domain on the sites LB.
+
+    The service, NEG and backend service are the ones in :class:`AppNames` —
+    a custom domain adds only a front door: its own host rule, its own
+    Google-managed certificate (the wildcard covers ``*.{apps domain}``, not
+    a customer domain) and its own DNS records. The platform host stays
+    routed as well, so the site keeps a working URL while the certificate
+    provisions.
+    """
+    hosts: list[str]
+    matcher: str
+    cert: str
+    cert_map_entries: dict[str, str] = field(default_factory=dict)  # hostname -> entry id
+    zone_for_new: str = ""
+
+
+def app_domain_names(website_name: str, domain: str, s: Settings) -> AppDomainNames:
+    """Per-domain front door of a Cloud Run website.
+
+    Named after the *domain*, like prod websites are: the resources belong
+    to the hostname they serve, and two websites can never collide on one.
+    """
+    domain = normalize_domain(domain)
+    hosts = [domain, f"www.{domain}"] if is_apex_domain(domain) else [domain]
+    return AppDomainNames(
+        hosts=hosts,
+        matcher=_named("wd-appd-", domain),
+        cert=_named("wd-appd-", domain),
+        cert_map_entries={h: _named("wd-appd-", h) for h in hosts},
+        zone_for_new=bounded_name(f"{safe_name(domain)}-zone"),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Legacy load balancers
 # ═══════════════════════════════════════════════════════════════════════
@@ -300,5 +335,8 @@ def public_url(ref: WebsiteRef, s: Settings) -> str:
     if ref.mode == "demo":
         return f"https://{s.SITES_DEMO_HOST}/{ref.website_name}/"
     if ref.mode == "cloudrun":
+        domain = normalize_domain(ref.domain)
+        if domain:
+            return f"https://{domain}/"
         return f"https://{app_names(ref.website_name, s).host}/"
     return f"https://{normalize_domain(ref.domain)}/"

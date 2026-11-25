@@ -298,6 +298,27 @@ def check_cloud_run_name_free(db, key: str, settings: Settings) -> None:
     )
 
 
+def check_domain_change(db, key: str, domain: Optional[str], settings: Settings) -> None:
+    """Refuse re-pointing an existing website at a *different* domain.
+
+    Only Cloud Run websites can reach here with a changing domain (prod
+    websites are keyed by theirs). The host rule, certificate and DNS records
+    are named after the domain, so swapping it would strand the previous
+    set: nothing would ever delete them, and the old hostname would keep
+    serving the site. Adding a domain to a website that has none is fine.
+    """
+    doc = get_website(db, key)
+    if doc is None:
+        return
+    current = normalize_domain(doc.get("domain"))
+    wanted = normalize_domain(domain)
+    if current and current != wanted:
+        raise WebsiteConflict(
+            f"This website already serves '{current}'. Redeploy it with that domain, "
+            f"or delete it first to move it to another one."
+        )
+
+
 def resolve_new_placement(compute, settings: Settings, mode: str, website_name: str, domain: str) -> Placement:
     """Where a website without a document lives.
 
@@ -336,7 +357,21 @@ def claim_for_deploy(
         doc = snap.to_dict()
         if doc.get("status", ACTIVE) != ACTIVE:
             raise WebsiteConflict("This website is being deleted — deployment cancelled.")
-        ref.update({"last_deployment_id": deployment_id, "updated_at": _now()})
+        update: dict = {"last_deployment_id": deployment_id, "updated_at": _now()}
+        # A Cloud Run website can gain a domain on a later deployment. The
+        # document has to learn about it, or teardown would never clean the
+        # host rule, certificate and DNS records named after it.
+        current, wanted = normalize_domain(doc.get("domain")), normalize_domain(domain)
+        if wanted and wanted != current:
+            if current:
+                raise WebsiteConflict(
+                    f"This website already serves '{current}' — delete it before "
+                    f"moving it to '{wanted}'."
+                )
+            doc["domain"] = wanted
+            update["domain"] = wanted
+            update["url"] = public_url(_ref(key, doc), settings)
+        ref.update(update)
         return doc
 
     placement = resolve_placement()  # GCP reads — keep them out of the transaction

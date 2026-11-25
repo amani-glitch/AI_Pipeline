@@ -94,7 +94,7 @@ def _prepare_website(db, settings: Settings, mode: str, website_name: str, domai
         settings.DEMO_DOMAIN, f"www.{settings.DEMO_DOMAIN}",
         settings.SITES_DEMO_HOST, settings.SITES_APPS_DOMAIN,
     }
-    if mode == DeploymentMode.PROD.value and domain in reserved:
+    if domain and domain in reserved:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"'{domain}' hosts the platform's own demo sites and cannot be deployed to.",
@@ -111,6 +111,9 @@ def _prepare_website(db, settings: Settings, mode: str, website_name: str, domai
         ws.check_deployable(db, key, settings)
         if mode == DeploymentMode.CLOUDRUN.value:
             ws.check_cloud_run_name_free(db, key, settings)
+            # A Cloud Run website's resources are named after its domain, so
+            # it can gain one but never be moved to a different one.
+            ws.check_domain_change(db, key, domain, settings)
     except ws.WebsiteConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return key, domain
@@ -180,14 +183,17 @@ async def create_deployment(
             ),
         )
 
-    # ── Validate domain for prod mode ─────────────────────────────────
+    # ── Validate domain ───────────────────────────────────────────────
+    # Prod websites must have one; Cloud Run websites may have one (served
+    # on it through a serverless NEG instead of the platform hostname);
+    # demo sites never do.
     if mode == DeploymentMode.PROD.value and not domain:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A domain is required for production deployments.",
         )
-    if mode != DeploymentMode.PROD.value:
-        domain = None  # only prod websites are keyed by domain
+    if mode not in (DeploymentMode.PROD.value, DeploymentMode.CLOUDRUN.value):
+        domain = None
     website_key, domain = await asyncio.to_thread(
         _prepare_website, db, settings, mode, website_name_lower, domain,
     )
@@ -436,7 +442,9 @@ async def create_deployment_from_git(
         )
     website_key, domain = await asyncio.to_thread(
         _prepare_website, db, settings, body.mode, website_name_lower,
-        body.domain if body.mode == DeploymentMode.PROD.value else None,
+        body.domain if body.mode in (
+            DeploymentMode.PROD.value, DeploymentMode.CLOUDRUN.value,
+        ) else None,
     )
 
     # ── Lookup git connection ────────────────────────────────────────

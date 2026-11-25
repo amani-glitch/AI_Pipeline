@@ -50,16 +50,25 @@ class Settings(BaseSettings):
     PROD_AUTO_CREATE_DNS_ZONE: bool = True
     PROD_AUTO_CREATE_SSL_CERT: bool = True
 
-    # Domain registration (Cloud Domains WHOIS contact)
-    DOMAINS_CONTACT_EMAIL: str = ""
-    DOMAINS_CONTACT_PHONE: str = ""
-    DOMAINS_CONTACT_COMPANY: str = "Best of Tours"
+    # ── Domain registration (Cloud Domains WHOIS contact) ────────────
+    # The registrant/admin/technical contact written into WHOIS for every
+    # domain the platform buys. These defaults are the company's standard
+    # registration details — the same ones on the domains already held in
+    # this project — so a registration never goes out half-filled.
+    # Phone numbers follow the Cloud Domains convention "+<cc>.<number>".
+    DOMAINS_CONTACT_EMAIL: str = "ahmed@bestoftours.co.uk"
+    DOMAINS_CONTACT_NAME: str = "Best of Tours SAS"
+    DOMAINS_CONTACT_PHONE: str = "+44.7739634908"
+    DOMAINS_CONTACT_COMPANY: str = "Best of Tours SAS"
     DOMAINS_CONTACT_COUNTRY: str = "FR"
     DOMAINS_CONTACT_STATE: str = ""
-    DOMAINS_CONTACT_CITY: str = ""
-    DOMAINS_CONTACT_ADDRESS: str = ""
-    DOMAINS_CONTACT_POSTAL_CODE: str = ""
+    DOMAINS_CONTACT_CITY: str = "Carpentras"
+    DOMAINS_CONTACT_ADDRESS: str = "26 rue de la Calade"
+    DOMAINS_CONTACT_POSTAL_CODE: str = "84200"
     DOMAINS_LOCATION: str = "global"
+    # WHOIS privacy: REDACTED_CONTACT_DATA hides the contact behind the
+    # registrar, PUBLIC_CONTACT_DATA publishes it. Some TLDs support only one.
+    DOMAINS_CONTACT_PRIVACY: str = "REDACTED_CONTACT_DATA"
 
     # Bucket
     BUCKET_LOCATION: str = "US"

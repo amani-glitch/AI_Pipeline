@@ -19,6 +19,7 @@ historiques.
 | **Demo** | `demo.digitaldatatest.com/mon-site/` | Path-based, bucket **partage** | Wildcard `*.digitaldatatest.com` | Un prefixe `mon-site/` dans le bucket partage |
 | **Production** | `mon-domaine.com` | Host-based | Certificate Manager, un cert par domaine | Bucket, backend bucket, host rule, cert, DNS |
 | **Cloud Run** | `mon-app.digitaldatatest.com` | Host-based → serverless NEG | Wildcard | Service, NEG, backend service, host rule, DNS A |
+| **Cloud Run + domaine** | `mon-app.com` (+ `www`) et l'hote plateforme | Host-based → le meme serverless NEG | Cert par domaine (Certificate Manager) | Les ressources Cloud Run + host rule, cert, zone et records DNS du domaine |
 
 ### LB dedie `webdeploy-sites`
 
@@ -30,6 +31,7 @@ IP webdeploy-sites-ip ──┬── :443 HTTPS proxy ── certificate map
                         │     URL map webdeploy-sites-urlmap
                         │       ├─ demo.digitaldatatest.com → backend bucket partage → gs://…-webdeploy-demo-sites/{site}/
                         │       ├─ mon-app.digitaldatatest.com → backend service → NEG serverless → Cloud Run
+                        │       ├─ mon-app.com, www.mon-app.com → le meme backend service (domaine Cloud Run)
                         │       └─ mon-domaine.com → backend bucket du domaine → bucket du domaine
                         └── :80 → redirection 301 vers HTTPS
 ```
@@ -314,17 +316,71 @@ Si le domaine est enregistre chez un registrar externe (GoDaddy, OVH...) :
 ### Concept
 
 Pour les applications qui ne sont pas des sites statiques (Node.js, Python, etc.),
-le code est conteneurise et deploye sur Cloud Run.
+le code est conteneurise et deploye sur Cloud Run, puis **mis derriere le LB de la
+plateforme** — pas servi depuis l'URL `*.run.app`, qui reste disponible mais n'est
+pas l'adresse publique du site.
+
+### Architecture GCP
+
+```
+Client → https://mon-app.digitaldatatest.com/        (hote plateforme, cert wildcard)
+      ou https://mon-app.com/ + https://www.mon-app.com/   (domaine du client)
+         │
+         ▼
+    IP webdeploy-sites-ip (136.x.x.x)
+         │
+    URL map webdeploy-sites-urlmap
+         ├─ host mon-app.digitaldatatest.com → path matcher wd-app-{nom}
+         └─ host mon-app.com, www.mon-app.com → path matcher wd-appd-{domaine}
+         │                                      (les deux pointent sur le MEME backend)
+         ▼
+    Backend service wd-app-{nom}        (EXTERNAL_MANAGED, protocole HTTPS, pas de CDN)
+         │
+         ▼
+    Serverless NEG regional wd-neg-{nom}   (europe-west1)
+         │
+         ▼
+    Service Cloud Run {nom}   ← image Artifact Registry, allUsers → roles/run.invoker
+```
+
+Un **serverless NEG** est le seul type de backend qui sait pointer vers un service
+Cloud Run : il ne contient pas d'adresses IP mais une reference `cloudRun.service`.
+Le backend service ne fait pas de CDN (le contenu est dynamique).
 
 ### Etapes specifiques
 
-1. Detection du type de projet (Node.js, Python, Go, etc.)
+1. Detection du type de projet (Node.js, Python, Go, statique en dernier recours)
 2. Generation automatique d'un Dockerfile
 3. Build de l'image Docker via Cloud Build
 4. Push vers Artifact Registry
-5. Deploiement sur Cloud Run
+5. Deploiement sur Cloud Run (`run.v2`, acces public)
+6. Serverless NEG + backend service + host rule sur `webdeploy-sites-urlmap`
+7. Record DNS A `mon-app.digitaldatatest.com` → IP du LB
 
-L'URL finale est geree par Cloud Run : `https://{service}-{hash}.run.app`
+### Domaine personnalise (optionnel)
+
+Le champ `domain` du mode Cloud Run declenche en plus :
+
+| Etape | Ressource |
+|-------|-----------|
+| Achat du domaine (si libre + confirme) | Registration Cloud Domains, contact WHOIS `DOMAINS_CONTACT_*` |
+| Zone DNS | Zone Cloud DNS `{domaine}-zone`, creee **avant** l'achat |
+| Routage | Host rule `wd-appd-{domaine}` → le meme backend service |
+| SSL | Certificat Google-managed `wd-appd-{domaine}` + entrees de certificate map (le wildcard ne couvre que `*.digitaldatatest.com`) |
+| DNS | Record A sur l'apex + CNAME `www` → apex |
+
+Ordre important : la zone est creee en premier pour que la registration soit
+soumise avec ses **vrais** nameservers (`ns-cloud-{a..f}{1..4}.googledomains.com`).
+Google repartit les zones sur plusieurs jeux ; un jeu devine ne resout rien.
+
+Les deux hotes restent routes. L'hote plateforme est couvert par le certificat
+wildcard et sert donc immediatement, pendant que le certificat du domaine passe
+par l'autorisation par load balancer (jusqu'a une heure apres que le DNS pointe
+sur le LB).
+
+Pour un domaine deja enregistre ailleurs (GoDaddy, OVH...), rien n'est achete : la
+zone Cloud DNS est creee et les nameservers a configurer chez le registrar sont
+affiches dans les logs du deploiement et dans l'email de notification.
 
 ---
 
@@ -335,7 +391,8 @@ L'URL finale est geree par Cloud Run : `https://{service}-{hash}.run.app`
 | Demo | Partage | 0 $ (1 cert) | 0 $ | Partage | ~0 $ supplementaire |
 | Subdomain | Partage | 0 $ (wildcard) | 0 $ (wildcard A) | Partage | ~0 $ supplementaire |
 | Production | Partage | ~0.75 $/cert | ~0.20 $/zone | Partage | ~1 $/domaine |
-| Cloud Run | N/A | Inclus | N/A | N/A | ~0-5 $/service |
+| Cloud Run | Partage | 0 $ (wildcard) | 0 $ (wildcard A) | N/A | ~0-5 $/service |
+| Cloud Run + domaine | Partage | ~0.75 $/cert | ~0.20 $/zone | N/A | ~0-5 $/service + ~1 $/domaine (+ prix annuel du domaine) |
 
 ---
 

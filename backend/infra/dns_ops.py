@@ -150,6 +150,32 @@ def create_zone(dns: Resource, project: str, zone_name: str, domain: str) -> dic
     )
 
 
+def zone_nameservers(dns: Resource, project: str, zone_name: str) -> list[str]:
+    """The four ``ns-cloud-*`` nameservers Google assigned to a managed zone."""
+    fresh = call_with_retries(
+        lambda: dns.managedZones().get(project=project, managedZone=zone_name).execute(),
+        description=f"read nameservers of {zone_name}",
+    )
+    return fresh.get("nameServers", [])
+
+
+def ensure_zone_for_domain(
+    dns: Resource, project: str, domain: str, zone_name_for_new: str,
+) -> tuple[dict, list[str], bool]:
+    """Get (or create) the managed zone that will host ``domain``'s records.
+
+    Returns ``(zone, nameservers, created)``. Creating the zone *before*
+    buying the domain is what lets the registration carry this zone's real
+    nameservers: a registration pointed at a guessed ``ns-cloud-a*`` set
+    resolves nothing when Google put the zone in another set.
+    """
+    zone = find_zone_for(dns, project, domain)
+    if zone is not None:
+        return zone, zone_nameservers(dns, project, zone["name"]), False
+    zone = create_zone(dns, project, zone_name_for_new, domain)
+    return zone, zone_nameservers(dns, project, zone["name"]), True
+
+
 def delete_zone_if_unused(dns: Resource, project: str, zone: dict) -> str:
     """Delete a WebDeploy-created zone once it holds nothing but NS/SOA.
 

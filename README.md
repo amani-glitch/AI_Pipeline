@@ -119,6 +119,39 @@ ne consomme ni regle ni backend bucket ne remplit plus rien.
 | **Cree** | Image Docker (Cloud Build) + service Cloud Run + serverless NEG + backend service + host rule + enregistrement DNS A |
 | **SSL** | Certificat wildcard `*.digitaldatatest.com` (autorisation DNS) |
 
+### 4. Mode Cloud Run + domaine personnalise
+
+Une application Cloud Run peut etre servie sur un **vrai nom de domaine**, que la
+plateforme enregistre elle-meme dans **Cloud Domains** si le domaine est libre.
+Le champ `domain` du mode Cloud Run est **optionnel** : sans lui, rien ne change.
+
+| Aspect | Detail |
+|--------|--------|
+| **URL** | `https://{domaine}/` (+ `https://www.{domaine}/` pour un domaine racine) |
+| **URL plateforme** | `https://{website_name}.digitaldatatest.com/` reste routee en parallele — elle sert immediatement pendant que le certificat du domaine se provisionne |
+| **Cree en plus** | Host rule `wd-appd-{domaine}` → **le meme backend service** (pas de second conteneur) + certificat Google-managed `wd-appd-{domaine}` + entrees de certificate map + zone Cloud DNS + records A / CNAME www |
+| **Registrar** | Achat via Cloud Domains (contact WHOIS = `DOMAINS_CONTACT_*`), uniquement si `PROD_AUTO_REGISTER_DOMAINS=true` **et** que l'utilisateur coche la confirmation d'achat |
+
+Chaine complete : `domaine → DNS (A) → IP du LB → URL map (host rule) → backend
+service → serverless NEG → service Cloud Run → conteneur`.
+
+**Ordre des operations** — la zone Cloud DNS est creee **avant** l'achat, et
+l'enregistrement du domaine est soumis avec les nameservers reels de cette zone
+(`ns-cloud-{a..f}*`). Un achat qui devinerait le jeu de nameservers ne resoudrait
+rien. Si le domaine est deja enregistre ailleurs (GoDaddy, OVH...), le
+deploiement cree la zone et affiche les nameservers a configurer chez le registrar.
+
+**Changement de domaine** — une fois qu'un site Cloud Run sert un domaine, il ne
+peut pas etre deplace vers un autre (409) : le host rule, le certificat et les
+records DNS portent le nom du domaine, et les laisser derriere orphelinerait des
+ressources que plus rien ne supprimerait. Supprimer le site puis le redeployer.
+Ajouter un domaine a un site qui n'en avait pas est en revanche accepte.
+
+**Suppression** — `plan_teardown` retire, en plus du plan Cloud Run habituel :
+host rule du domaine, entrees de certificate map, certificat, records DNS (et la
+zone si la plateforme l'a creee et qu'elle est vide). Chaque etape reste gardee
+par la propriete : un hote re-pointe ailleurs entre-temps est conserve, pas casse.
+
 ---
 
 ## Pipeline en 9 Etapes
@@ -167,12 +200,13 @@ Provisionne une fois par `python -m scripts.provision_sites_lb` (idempotent, dep
 | URL map HTTPS / redirection HTTP | `webdeploy-sites-urlmap` / `webdeploy-sites-http-redirect` |
 | Proxies | `webdeploy-sites-https-proxy` / `webdeploy-sites-http-proxy` |
 | Forwarding rules | `webdeploy-sites-https-rule` (443) / `webdeploy-sites-http-rule` (80) |
-| Certificate map | `webdeploy-sites-certmap` (wildcard `*.digitaldatatest.com` + un cert par domaine prod) |
+| Certificate map | `webdeploy-sites-certmap` (wildcard `*.digitaldatatest.com` + un cert par domaine prod et par domaine Cloud Run) |
 | Bucket demo partage | `{projet}-webdeploy-demo-sites` + backend bucket `webdeploy-sites-demo` |
 | DNS | `demo.digitaldatatest.com` A → IP du LB |
 
 Capacite : `GET /api/websites/sites-lb/status` (admin) donne la taille estimee de
-l'URL map. Seuls les sites prod et Cloud Run y ajoutent une entree (~150 octets).
+l'URL map. Seuls les sites prod et Cloud Run y ajoutent une entree (~150 octets) —
+un site Cloud Run avec domaine personnalise en ajoute deux (hote plateforme + domaine).
 
 ### Load balancers historiques (lecture + suppression uniquement)
 
@@ -324,7 +358,16 @@ Tous les Dockerfiles generes exposent le port **8080** (exigence Cloud Run).
 | Methode | Description |
 |---------|-------------|
 | `check_domain(domain)` | Verifie dans l'ordre : Cloud Domains → Cloud DNS → searchDomains |
-| `register_domain(domain)` | Achete via Cloud Domains API avec contact WHOIS depuis les settings |
+| `ensure_dns_zone(domain)` | Cree (ou retrouve) la zone Cloud DNS du domaine et renvoie ses nameservers reels |
+| `missing_contact_fields()` | Champs WHOIS manquants — verifie **avant** tout achat |
+| `register_domain(domain, name_servers=None, validate_only=False)` | Achete via Cloud Domains, en soumettant les nameservers de la zone ; `validate_only=True` fait un essai a blanc (rien n'est cree ni achete) |
+
+**Contact WHOIS** (`DOMAINS_CONTACT_*`) : les valeurs par defaut de `config.py` sont
+les coordonnees standard de l'entreprise (Best of Tours SAS, Carpentras 84200, FR),
+identiques a celles des domaines deja detenus dans le projet. `recipients` porte le
+nom de l'entite, jamais une adresse email. Confidentialite par defaut :
+`REDACTED_CONTACT_DATA` ; une valeur inconnue retombe sur ce mode plutot que de
+publier les coordonnees.
 
 **Statuts retournes par `check_domain()` :**
 - `"owned"` — Domaine enregistre dans le projet GCP (Cloud Domains ou Cloud DNS)
@@ -396,7 +439,7 @@ Tous les Dockerfiles generes exposent le port **8080** (exigence Cloud Run).
 | `file` | File | Oui | Fichier ZIP ou HTML |
 | `mode` | String | Oui | `demo`, `prod`, ou `cloudrun` |
 | `website_name` | String | Oui | Slug du site (a-z, 0-9, tirets) |
-| `domain` | String | Prod seulement | Domaine personnalise |
+| `domain` | String | Obligatoire en prod, optionnel en `cloudrun` | Domaine personnalise |
 | `deployer_first_name` | String | Oui | Prenom du deployer |
 | `deployer_last_name` | String | Oui | Nom du deployer |
 | `deployer_email` | String | Oui | Email du deployer |
