@@ -151,12 +151,17 @@ def create_zone(dns: Resource, project: str, zone_name: str, domain: str) -> dic
 
 
 def zone_nameservers(dns: Resource, project: str, zone_name: str) -> list[str]:
-    """The four ``ns-cloud-*`` nameservers Google assigned to a managed zone."""
+    """The four ``ns-cloud-*`` nameservers Google assigned to a managed zone.
+
+    Returned without the trailing dot Cloud DNS adds: these strings go into a
+    Cloud Domains registration and into the instructions a user retypes at
+    their registrar, and both want the bare hostname.
+    """
     fresh = call_with_retries(
         lambda: dns.managedZones().get(project=project, managedZone=zone_name).execute(),
         description=f"read nameservers of {zone_name}",
     )
-    return fresh.get("nameServers", [])
+    return [ns.rstrip(".") for ns in fresh.get("nameServers", [])]
 
 
 def ensure_zone_for_domain(
@@ -265,11 +270,7 @@ def ensure_host_records(
     log(f"DNS {domain}{' (+www)' if apex else ''} -> {ip} in zone {zone['name']}")
 
     if created:
-        fresh = call_with_retries(
-            lambda: dns.managedZones().get(project=project, managedZone=zone["name"]).execute(),
-            description="read zone nameservers",
-        )
-        return fresh.get("nameServers", [])
+        return zone_nameservers(dns, project, zone["name"])
     return []
 
 

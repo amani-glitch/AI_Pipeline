@@ -210,13 +210,18 @@ export default function DeploymentForm() {
 
   // Auto-slugify website name: lowercase, replace spaces/underscores with hyphens,
   // remove non-alphanumeric characters (except hyphens), collapse multiple hyphens.
+  // A *trailing* hyphen is kept while typing: stripping it on every keystroke
+  // made "my-site" impossible to type (the "-" vanished as soon as it was
+  // typed). It is trimmed when the field loses focus and before submitting.
   const slugify = (value) =>
     value
       .toLowerCase()
       .replace(/[\s_]+/g, "-")
       .replace(/[^a-z0-9-]/g, "")
       .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
+      .replace(/^-+/, "");
+
+  const trimSlug = (value) => value.trim().replace(/-+$/, "");
 
   const handleWebsiteNameChange = useCallback((e) => {
     setWebsiteName(slugify(e.target.value));
@@ -246,7 +251,7 @@ export default function DeploymentForm() {
 
   const canSubmit =
     (hasUpload || hasGitSource) &&
-    websiteName.trim().length > 0 &&
+    trimSlug(websiteName).length > 1 &&
     deployerFirstName.trim().length > 0 &&
     deployerLastName.trim().length > 0 &&
     deployerEmail.trim().length > 0 &&
@@ -302,6 +307,8 @@ export default function DeploymentForm() {
       setSubmitting(true);
       setError(null);
 
+      const siteName = trimSlug(websiteName);
+
       // Subdomain UI mode is translated to backend mode=prod with composed domain.
       // prod_deployer detects the parent Cloud DNS zone and adds an A record.
       const backendMode = mode === "subdomain" ? "prod" : mode;
@@ -320,7 +327,7 @@ export default function DeploymentForm() {
             commit_sha: fromGitCommit || gitContext.event.commit_sha,
             push_event_id: gitContext.event.id,
             mode: backendMode,
-            website_name: websiteName.trim(),
+            website_name: siteName,
             deployer_first_name: deployerFirstName.trim(),
             deployer_last_name: deployerLastName.trim(),
             deployer_email: deployerEmail.trim(),
@@ -349,7 +356,7 @@ export default function DeploymentForm() {
         }
 
         formData.append("mode", backendMode);
-        formData.append("website_name", websiteName.trim());
+        formData.append("website_name", siteName);
         formData.append("deployer_first_name", deployerFirstName.trim());
         formData.append("deployer_last_name", deployerLastName.trim());
         formData.append("deployer_email", deployerEmail.trim());
@@ -576,6 +583,7 @@ export default function DeploymentForm() {
               type="text"
               value={websiteName}
               onChange={handleWebsiteNameChange}
+              onBlur={() => setWebsiteName(trimSlug)}
               placeholder="my-awesome-site"
               className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
                 focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:border-transparent
@@ -725,6 +733,7 @@ export default function DeploymentForm() {
                     type="text"
                     value={subdomainLabel}
                     onChange={(e) => setSubdomainLabel(slugify(e.target.value))}
+                    onBlur={() => setSubdomainLabel(trimSlug)}
                     placeholder="blog"
                     className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
                       focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent

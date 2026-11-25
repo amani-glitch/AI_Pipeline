@@ -245,11 +245,11 @@ class DomainService:
                 ),
             )
 
-        except Exception as exc:
+        except Exception:
             logger.exception("Error searching domain availability for %s", domain)
             return DomainCheckResult(
                 status="external",
-                message=f"Impossible de vérifier le domaine (erreur API). Vous pouvez quand même déployer.",
+                message="Impossible de vérifier le domaine (erreur API). Vous pouvez quand même déployer.",
             )
 
     # ── Register domain ──────────────────────────────────────────────
