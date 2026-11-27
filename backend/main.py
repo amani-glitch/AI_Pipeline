@@ -27,6 +27,7 @@ from services.zip_backup import restore_zip
 # ── Route imports ─────────────────────────────────────────────────────
 from api.routes.auth import router as auth_router
 from api.routes.deployments import router as deployments_router
+from api.routes.cloud_run import router as cloud_run_router
 from api.routes.domains import router as domains_router
 from api.routes.health import router as health_router
 from api.routes.statistics import router as statistics_router
@@ -402,6 +403,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(deployments_router)
 app.include_router(domains_router)
+app.include_router(cloud_run_router)
 app.include_router(health_router)
 app.include_router(statistics_router)
 app.include_router(websocket_router)

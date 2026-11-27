@@ -37,6 +37,47 @@ export async function deployFromGit(body) {
 }
 
 /**
+ * Serve an existing Cloud Run service on a real domain — no sources, no build.
+ * @param {object} body - { service, region?, domain, website_name?,
+ *   allow_unauthenticated?, domain_purchase_confirmed?, notification_emails?,
+ *   deployer_* }
+ */
+export async function deployCloudRunService(body) {
+  const response = await api.post("/api/deploy/cloud-run-service", body, {
+    timeout: 120000,
+  });
+  return response.data;
+}
+
+/**
+ * Every Cloud Run service of the platform's GCP project, all regions.
+ * @param {string} [q] - Optional filter on the service name or URL.
+ * @returns {Promise<object[]>} [{ name, region, url, ingress, lb_reachable }]
+ */
+export async function listCloudRunServices(q) {
+  const response = await api.get("/api/cloud-run/services", {
+    params: q ? { q } : undefined,
+    timeout: 60000,
+  });
+  return response.data.services || [];
+}
+
+/**
+ * Resolve a pasted .run.app URL (or a service name) to the service it names,
+ * and report whether the load balancer can already reach it.
+ * @param {string} reference - URL or service name.
+ * @param {string} [region] - Needed only when a name exists in several regions.
+ */
+export async function resolveCloudRunService(reference, region) {
+  const response = await api.post(
+    "/api/cloud-run/resolve",
+    { reference, region: region || null },
+    { timeout: 60000 },
+  );
+  return response.data;
+}
+
+/**
  * List deployments, newest first, optionally restricted to a date range.
  * @param {object} [options]
  * @param {string} [options.startDate] - Earliest day to include, YYYY-MM-DD.

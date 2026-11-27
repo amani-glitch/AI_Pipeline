@@ -75,6 +75,16 @@ class DeploymentConfig(BaseModel):
     deployer_email: str = ""
     ai_enabled: bool = False
     domain_purchase_confirmed: bool = False
+    # Set when the deployment links an existing Cloud Run service instead of
+    # building one from uploaded sources: there is nothing to extract, build
+    # or upload, and the service is not the platform's to delete later.
+    run_service: Optional[str] = None
+    run_region: Optional[str] = None
+    allow_unauthenticated: bool = True
+
+    @property
+    def links_existing_service(self) -> bool:
+        return bool(self.run_service)
 
 
 class StepInfo(BaseModel):
@@ -180,6 +190,7 @@ class PipelineContext(BaseModel):
     project_type: Optional[str] = None
     docker_image_uri: Optional[str] = None
     cloudrun_service_name: Optional[str] = None
+    cloudrun_region: Optional[str] = None
     ai_token_usage: dict = {}
     dns_nameservers: list[str] = []
     website_key: Optional[str] = None

@@ -205,19 +205,31 @@ class SitesLB:
             ],
         )
 
-    def expose_cloud_run(self, website_name: str, domain: Optional[str] = None) -> dict:
-        """Put a deployed Cloud Run service behind the LB.
+    def expose_cloud_run(
+        self,
+        website_name: str,
+        domain: Optional[str] = None,
+        *,
+        service: str = "",
+        region: str = "",
+    ) -> dict:
+        """Put a Cloud Run service behind the LB.
 
         Always at the platform host ``{app}.{apps domain}`` (covered by the
         wildcard certificate, so it serves immediately), and additionally on
         ``domain`` when the website has one of its own. Both hosts route to
         the same serverless NEG, so the container is deployed once.
 
+        ``service`` / ``region`` name a service the platform did not build
+        (the "link an existing service" flow). The NEG is regional and must
+        sit where the service does, so the region follows the service rather
+        than ``CLOUDRUN_REGION``.
+
         Returns ``url`` (the site's public address — the custom domain when
         there is one), ``platform_url``, the resource inventory and any
         nameservers a newly created DNS zone needs at the registrar.
         """
-        names = app_names(website_name, self.s)
+        names = app_names(website_name, self.s, service, region)
         ip = self.ip()
 
         current = dns_ops.get_record(self.dns, self.project, self.n.dns_zone, names.host, "A")
@@ -237,7 +249,10 @@ class SitesLB:
 
         self._route_hosts([names.host], names.matcher, bes_link)
         dns_ops.ensure_record(self.dns, self.project, self.n.dns_zone, names.host, "A", [ip])
-        self.log(f"[INFRA] https://{names.host}/ → Cloud Run '{names.service}' (wildcard certificate)")
+        self.log(
+            f"[INFRA] https://{names.host}/ → Cloud Run '{names.service}' "
+            f"({names.region}, wildcard certificate)"
+        )
 
         platform_url = f"https://{names.host}/"
         result = {
@@ -245,7 +260,8 @@ class SitesLB:
             "platform_url": platform_url,
             "dns_nameservers": [],
             "resources": [
-                {"kind": "cloud_run_service", "name": names.service},
+                {"kind": "cloud_run_service", "name": names.service,
+                 "region": names.region, "external": bool(service)},
                 {"kind": "serverless_neg", "name": names.neg},
                 {"kind": "backend_service", "name": names.backend_service},
                 {"kind": "host_rule", "name": names.host, "url_map": self.n.url_map},

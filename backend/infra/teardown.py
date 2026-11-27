@@ -119,7 +119,7 @@ def plan_teardown(ref: WebsiteRef, s: Settings) -> list[Step]:
     if ref.mode == "cloudrun":
         # Same plan for Cloud Run websites made before the sites LB existed:
         # their LB steps simply find nothing.
-        a = app_names(ref.website_name, s)
+        a = app_names(ref.website_name, s, ref.run_service, ref.run_region)
         add(Step("routing", ROUTING, "url_map.remove_host_route",
                  {"url_map": n.url_map, "hosts": [a.host],
                   "owned": [url_map_ops.backend_service_key(a.backend_service)]},
@@ -148,11 +148,15 @@ def plan_teardown(ref: WebsiteRef, s: Settings) -> list[Step]:
             add(Step("dns-domain", DNS + 1, "dns.cleanup_host",
                      {"domain": ref.domain, "address": n.ip},
                      f"DNS records {ref.domain}", hosts=hosts))
-        add(Step("cloud-run", COMPUTE, "run.delete_service",
-                 {"name": a.service, "region": a.region}, f"Cloud Run service {a.service}"))
-        add(Step("images", COMPUTE + 1, "ar.delete_package",
-                 {"package": a.ar_package, "region": a.region, "repo": s.CLOUDRUN_ARTIFACT_REPO},
-                 f"Artifact Registry images {a.ar_package}"))
+        if not ref.external_service:
+            # A *linked* website only ever owned the front door: the service
+            # and its images existed before WebDeploy was pointed at them and
+            # outlive it. Deleting them would destroy someone else's app.
+            add(Step("cloud-run", COMPUTE, "run.delete_service",
+                     {"name": a.service, "region": a.region}, f"Cloud Run service {a.service}"))
+            add(Step("images", COMPUTE + 1, "ar.delete_package",
+                     {"package": a.ar_package, "region": a.region, "repo": s.CLOUDRUN_ARTIFACT_REPO},
+                     f"Artifact Registry images {a.ar_package}"))
 
     elif ref.placement == Placement.SITES and ref.mode == "demo":
         prefix = demo_prefix(ref.website_name)

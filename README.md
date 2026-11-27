@@ -152,6 +152,34 @@ host rule du domaine, entrees de certificate map, certificat, records DNS (et la
 zone si la plateforme l'a creee et qu'elle est vide). Chaque etape reste gardee
 par la propriete : un hote re-pointe ailleurs entre-temps est conserve, pas casse.
 
+### 5. Lier un service Cloud Run existant a un domaine
+
+Meme resultat que le mode 4, **sans code source** : l'application tourne deja sur
+Cloud Run et la plateforme ne pose que la facade. L'utilisateur donne deux
+choses — l'URL (ou le nom) du service, et le domaine — et rien d'autre.
+
+| Aspect | Detail |
+|--------|--------|
+| **Entree** | URL `.run.app` du service (les deux generations d'URL sont acceptees) ou son nom + region ; le domaine est **obligatoire** |
+| **API** | `POST /api/deploy/cloud-run-service` ; `GET /api/cloud-run/services` liste les services du projet, `POST /api/cloud-run/resolve` verifie une URL collee |
+| **Pipeline** | `DOMAIN_REGISTER → INFRA → NOTIFY` — EXTRACT, AI_*, BUILD, VERIFY et UPLOAD sont marques `skipped` (aucune source) |
+| **Cree** | Serverless NEG **dans la region du service** + backend service + host rules (domaine et hote plateforme) + certificat + zone et records Cloud DNS |
+| **Ne cree pas** | Ni image Docker, ni service Cloud Run : le conteneur existant est reutilise tel quel |
+| **Acces** | Un LB externe appelle Cloud Run **sans authentification** : la plateforme accorde `allUsers → roles/run.invoker` (case cochee par defaut, fusionnee dans la policy existante). Sans cela le domaine repond 403 |
+| **Ingress** | Un service en `INGRESS_TRAFFIC_INTERNAL_ONLY` est signale : le load balancer ne peut pas l'atteindre |
+
+**Resolution du service** — l'URL collee est comparee aux services reels du
+projet plutot qu'analysee a l'aveugle : Cloud Run a eu plusieurs formats d'URL
+(`{svc}-{numero projet}.{region}.run.app` aujourd'hui,
+`{svc}-{hash}-{code region}.a.run.app` avant), et un service d'un autre projet
+ne peut de toute facon pas etre place derriere ce load balancer (422).
+
+**Suppression** — le plan de teardown retire la facade (host rules, certificat,
+DNS, backend service, NEG) et **jamais** le service Cloud Run ni ses images : ils
+existaient avant et appartiennent a leur proprietaire. Le site retient sa source
+(`external_service` sur le document website) : on ne peut pas deployer un ZIP sur
+un site lie, ni lier un service a un site construit depuis des sources (409).
+
 ---
 
 ## Pipeline en 9 Etapes

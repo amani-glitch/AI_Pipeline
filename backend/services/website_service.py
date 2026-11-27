@@ -159,6 +159,9 @@ def _ref(key: str, doc: dict) -> WebsiteRef:
         website_name=doc.get("website_name") or (rest if mode not in ("prod",) else ""),
         domain=doc.get("domain") or (rest if mode == "prod" else ""),
         placement=Placement(doc.get("placement") or _infer_placement(mode, []).value),
+        run_service=doc.get("run_service") or "",
+        run_region=doc.get("run_region") or "",
+        external_service=bool(doc.get("external_service")),
     )
 
 
@@ -180,6 +183,16 @@ def _doc_from_records(key: str, records: list, settings: Settings) -> dict:
         "updated_at": _now(),
         "backfilled": True,
     }
+    # A website reconstructed from its deployments must still know it only
+    # borrows its Cloud Run service, or a delete would destroy a container
+    # the platform never created.
+    for r in records:
+        details = getattr(r, "infra_details", None) or {}
+        if details.get("run_service"):
+            doc["run_service"] = details["run_service"]
+            doc["run_region"] = details.get("run_region") or ""
+            doc["external_service"] = bool(details.get("external_service"))
+            break
     doc["url"] = public_url(_ref(key, doc), settings)
     return doc
 
@@ -298,6 +311,41 @@ def check_cloud_run_name_free(db, key: str, settings: Settings) -> None:
     )
 
 
+def check_linked_service(
+    db, key: str, settings: Settings, *,
+    external: bool, service: str = "", region: str = "",
+) -> None:
+    """Refuse changing what a Cloud Run website is served from.
+
+    A website either owns a service WebDeploy built from sources, or points
+    at one that existed already — never both, and never a different one.
+    Swapping sources would leave the old side stranded: a platform-built
+    service nothing would ever delete, or a NEG in the wrong region (it must
+    sit where the service does, and a NEG cannot move).
+    """
+    doc = get_website(db, key)
+    if doc is None:
+        return
+    was_external = bool(doc.get("external_service"))
+    if was_external != external:
+        raise WebsiteConflict(
+            "Ce site est déjà déployé depuis un code source — supprimez-le avant "
+            "de le lier à un service Cloud Run existant."
+            if was_external is False else
+            "Ce site est lié à un service Cloud Run existant — supprimez-le avant "
+            "d'y déployer un code source."
+        )
+    if not external:
+        return
+    current_service = doc.get("run_service") or ""
+    current_region = doc.get("run_region") or ""
+    if current_service and (current_service, current_region) != (service, region):
+        raise WebsiteConflict(
+            f"Ce site pointe déjà sur le service '{current_service}' "
+            f"({current_region}). Supprimez-le pour le lier à un autre service."
+        )
+
+
 def check_domain_change(db, key: str, domain: Optional[str], settings: Settings) -> None:
     """Refuse re-pointing an existing website at a *different* domain.
 
@@ -345,6 +393,7 @@ def resolve_new_placement(compute, settings: Settings, mode: str, website_name: 
 def claim_for_deploy(
     db, settings: Settings, *, key: str, mode: str, website_name: str, domain: Optional[str],
     deployment_id: str, deployer_email: str, resolve_placement: Callable[[], Placement],
+    run_service: str = "", run_region: str = "", external_service: bool = False,
 ) -> dict:
     """Get (or create) the website document for a deployment's INFRA step.
 
@@ -358,6 +407,24 @@ def claim_for_deploy(
         if doc.get("status", ACTIVE) != ACTIVE:
             raise WebsiteConflict("This website is being deleted — deployment cancelled.")
         update: dict = {"last_deployment_id": deployment_id, "updated_at": _now()}
+        # Which Cloud Run service backs the site, and whether the platform
+        # built it. Teardown reads both: the region locates the NEG, and the
+        # flag decides whether the service itself is ours to delete.
+        if bool(doc.get("external_service")) != external_service:
+            raise WebsiteConflict(
+                "Ce site n'a pas été déployé de cette façon — supprimez-le avant "
+                "de changer sa source."
+            )
+        if run_service:
+            current_service = doc.get("run_service") or ""
+            if current_service and (current_service, doc.get("run_region") or "") != (run_service, run_region):
+                raise WebsiteConflict(
+                    f"Ce site pointe déjà sur le service '{current_service}' — "
+                    "supprimez-le pour le lier à un autre service."
+                )
+            doc["run_service"], doc["run_region"] = run_service, run_region
+            update["run_service"], update["run_region"] = run_service, run_region
+            update["external_service"] = external_service
         # A Cloud Run website can gain a domain on a later deployment. The
         # document has to learn about it, or teardown would never clean the
         # host rule, certificate and DNS records named after it.
@@ -385,6 +452,9 @@ def claim_for_deploy(
         "owner_email": deployer_email,
         "current_deployment_id": None,
         "last_deployment_id": deployment_id,
+        "run_service": run_service,
+        "run_region": run_region,
+        "external_service": external_service,
         "created_at": _now(),
         "updated_at": _now(),
     }

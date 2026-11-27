@@ -68,7 +68,10 @@ MAX_BULK_DELETE = 200
 #  POST /api/deploy — create a new deployment
 # ═══════════════════════════════════════════════════════════════════════
 
-def _prepare_website(db, settings: Settings, mode: str, website_name: str, domain: Optional[str]):
+def _prepare_website(
+    db, settings: Settings, mode: str, website_name: str, domain: Optional[str],
+    *, linked: Optional[tuple[str, str]] = None,
+):
     """Validate the target website and return ``(website_key, domain)``.
 
     Refuses up front (409) when the website is being deleted or already has a
@@ -110,7 +113,14 @@ def _prepare_website(db, settings: Settings, mode: str, website_name: str, domai
     try:
         ws.check_deployable(db, key, settings)
         if mode == DeploymentMode.CLOUDRUN.value:
-            ws.check_cloud_run_name_free(db, key, settings)
+            if linked is None:
+                # Only a website the platform *builds* claims a service name;
+                # a linked one points at a service that exists by definition.
+                ws.check_cloud_run_name_free(db, key, settings)
+            ws.check_linked_service(
+                db, key, settings, external=linked is not None,
+                service=linked[0] if linked else "", region=linked[1] if linked else "",
+            )
             # A Cloud Run website's resources are named after its domain, so
             # it can gain one but never be moved to a different one.
             ws.check_domain_change(db, key, domain, settings)
@@ -559,6 +569,170 @@ async def create_deployment_from_git(
     logger.info(
         "Git deployment %s queued (repo=%s, commit=%s, mode=%s)",
         deployment_id, conn.repo_name, body.commit_sha[:12], body.mode,
+    )
+    return DeploymentCreateResponse(deployment_id=deployment_id, status="queued")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  POST /api/deploy/cloud-run-service — serve an existing service on a domain
+# ═══════════════════════════════════════════════════════════════════════
+
+class DeployCloudRunServiceRequest(BaseModel):
+    """Request body for /api/deploy/cloud-run-service.
+
+    ``service`` is what the user has at hand: the service's ``.run.app``
+    address, or its name (with ``region`` when the name is used in several).
+    """
+    service: str = Field(..., description="Cloud Run service URL or name")
+    region: Optional[str] = Field(None, description="Region, when the name is ambiguous")
+    domain: str = Field(..., description="Domain the service should be served on")
+    website_name: Optional[str] = Field(None, description="Defaults to the service name")
+    allow_unauthenticated: bool = True
+    domain_purchase_confirmed: bool = False
+    notification_emails: Optional[str] = ""
+    deployer_first_name: str = ""
+    deployer_last_name: str = ""
+    deployer_email: str = ""
+
+
+def _website_name_for(service_name: str) -> str:
+    """Default website slug for a linked service.
+
+    Cloud Run ids are already lowercase letters, digits and hyphens, so only
+    the platform's own extra rule has to be applied: no ``--`` (it would
+    collide with the hashed resource names derived from it).
+    """
+    slug = re.sub(r"-{2,}", "-", service_name.strip().lower()).strip("-")
+    return slug[:63].rstrip("-")
+
+
+@router.post(
+    "/deploy/cloud-run-service",
+    response_model=DeploymentCreateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_deployment_from_cloud_run_service(
+    body: DeployCloudRunServiceRequest,
+    user=Depends(require_approved),
+    db=Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> DeploymentCreateResponse:
+    """Serve an already-running Cloud Run service on a real domain.
+
+    No sources, no build: the platform resolves the service, puts it behind
+    the sites load balancer through a serverless NEG and a backend service,
+    registers the domain when it is available and confirmed, creates its
+    Cloud DNS zone and records, and provisions a Google-managed certificate
+    for it. The service itself stays the user's — deleting the website here
+    removes the front door, never the container.
+    """
+    from services.cloud_run_catalog import CloudRunCatalog, CloudRunLookupError
+
+    # ── Permissions and quotas ───────────────────────────────────────
+    require_deploy_permission(DeploymentMode.CLOUDRUN.value, user)
+    from api.routes.quotas import check_quota
+    check_quota(db, user)
+
+    # ── Resolve the service ──────────────────────────────────────────
+    try:
+        service = await asyncio.to_thread(
+            lambda: CloudRunCatalog(settings).resolve(body.service, body.region)
+        )
+    except CloudRunLookupError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Could not resolve Cloud Run service %r", body.service)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Impossible de vérifier ce service Cloud Run : {exc}",
+        ) from exc
+
+    # ── The domain is the point of this flow ─────────────────────────
+    domain = (body.domain or "").strip().lower()
+    if not domain or "." not in domain:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Indiquez le nom de domaine sur lequel servir ce service Cloud Run.",
+        )
+
+    # ── Website name: the service's own, unless one was given ────────
+    website_name_lower = (body.website_name or "").lower().strip() or _website_name_for(service.name)
+    if len(website_name_lower) < 2 or not _SLUG_RE.match(website_name_lower):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Nom de site invalide '{website_name_lower}'. Minuscules, chiffres "
+                "et tirets, 2 caractères au minimum."
+            ),
+        )
+
+    website_key, domain = await asyncio.to_thread(
+        _prepare_website, db, settings, DeploymentMode.CLOUDRUN.value,
+        website_name_lower, domain, linked=(service.name, service.region),
+    )
+
+    # ── Deployer identity ────────────────────────────────────────────
+    deployer_email = (body.deployer_email or getattr(user, "email", "")).strip()
+    first_name = body.deployer_first_name.strip()
+    last_name = body.deployer_last_name.strip()
+    if not first_name and getattr(user, "display_name", ""):
+        parts = user.display_name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else last_name
+
+    email_list: list[str] = []
+    if body.notification_emails:
+        email_list = [e.strip() for e in body.notification_emails.split(",") if e.strip()]
+    if deployer_email and deployer_email not in email_list:
+        email_list.append(deployer_email)
+
+    # ── DB record ────────────────────────────────────────────────────
+    deployment_id = str(uuid.uuid4())
+    crud.create_deployment(
+        db,
+        deployment_id=deployment_id,
+        website_name=website_name_lower,
+        mode=DeploymentMode.CLOUDRUN.value,
+        domain=domain,
+        notification_emails=", ".join(email_list) if email_list else "",
+        zip_filename=None,
+        deployer_first_name=first_name,
+        deployer_last_name=last_name,
+        deployer_email=deployer_email,
+        ai_enabled=False,
+        website_key=website_key,
+    )
+    db.collection("deployments").document(deployment_id).update({
+        "run_service": service.name,
+        "run_region": service.region,
+        "external_service": True,
+    })
+
+    deploy_config = DeploymentConfig(
+        mode=DeploymentMode.CLOUDRUN,
+        website_name=website_name_lower,
+        domain=domain,
+        notification_emails=email_list,
+        deployer_first_name=first_name,
+        deployer_last_name=last_name,
+        deployer_email=deployer_email,
+        ai_enabled=False,
+        domain_purchase_confirmed=body.domain_purchase_confirmed,
+        run_service=service.name,
+        run_region=service.region,
+        allow_unauthenticated=body.allow_unauthenticated,
+    )
+
+    # No ZIP to hand the pipeline — the container is already built and running.
+    orchestrator = PipelineOrchestrator(settings)
+    asyncio.create_task(
+        orchestrator.run(deployment_id, "", deploy_config),
+        name=f"pipeline-{deployment_id[:8]}",
+    )
+
+    logger.info(
+        "Cloud Run link deployment %s queued (service=%s/%s, domain=%s)",
+        deployment_id, service.region, service.name, domain,
     )
     return DeploymentCreateResponse(deployment_id=deployment_id, status="queued")
 

@@ -31,6 +31,32 @@ class PipelineStep(str, Enum):
     NOTIFY = "NOTIFY"
 
 
+#: The order the orchestrator runs the steps in.
+PIPELINE_STEPS = [
+    PipelineStep.EXTRACT,
+    PipelineStep.AI_INSPECT,
+    PipelineStep.AI_FIX,
+    PipelineStep.BUILD,
+    PipelineStep.VERIFY,
+    PipelineStep.DOMAIN_REGISTER,
+    PipelineStep.INFRA,
+    PipelineStep.UPLOAD,
+    PipelineStep.NOTIFY,
+]
+
+#: Steps that act on uploaded sources. A deployment that links an existing
+#: Cloud Run service has none — the container is already built and running —
+#: so its pipeline is DOMAIN_REGISTER → INFRA → NOTIFY.
+SOURCE_STEPS = (
+    PipelineStep.EXTRACT,
+    PipelineStep.AI_INSPECT,
+    PipelineStep.AI_FIX,
+    PipelineStep.BUILD,
+    PipelineStep.VERIFY,
+    PipelineStep.UPLOAD,
+)
+
+
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"

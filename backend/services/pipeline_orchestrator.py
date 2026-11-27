@@ -20,6 +20,8 @@ from config import Settings
 from db.database import SessionLocal
 from db import crud
 from models.enums import (
+    PIPELINE_STEPS as _PIPELINE_STEPS,
+    SOURCE_STEPS as _SOURCE_STEPS,
     DeploymentMode,
     DeploymentStatus,
     LogLevel,
@@ -34,18 +36,6 @@ logger = logging.getLogger("webdeploy.orchestrator")
 # ── Lazy imports for service classes ──────────────────────────────────
 # Imported at call-time so the module can be loaded even when heavy
 # GCP / Anthropic libraries are not installed in the environment.
-
-_PIPELINE_STEPS = [
-    PipelineStep.EXTRACT,
-    PipelineStep.AI_INSPECT,
-    PipelineStep.AI_FIX,
-    PipelineStep.BUILD,
-    PipelineStep.VERIFY,
-    PipelineStep.DOMAIN_REGISTER,
-    PipelineStep.INFRA,
-    PipelineStep.UPLOAD,
-    PipelineStep.NOTIFY,
-]
 
 
 class PipelineOrchestrator:
@@ -161,6 +151,17 @@ class PipelineOrchestrator:
                             level=LogLevel.INFO.value, step=step.value,
                         )
                         continue
+
+                # ── Linked service: no sources to extract, build or upload ──
+                if ctx.config.links_existing_service and step in _SOURCE_STEPS:
+                    crud.update_step_status(
+                        db, deployment_id, step.value, StepStatus.SKIPPED.value,
+                    )
+                    log_cb(
+                        "Service Cloud Run existant — aucune source à traiter, étape ignorée",
+                        level=LogLevel.INFO.value, step=step.value,
+                    )
+                    continue
 
                 # ── AI_INSPECT / AI_FIX: skip when AI is disabled ────────
                 if step in (PipelineStep.AI_INSPECT, PipelineStep.AI_FIX):
@@ -575,11 +576,14 @@ class PipelineOrchestrator:
             raise RuntimeError(f"Mode '{mode}' can no longer be deployed")
 
         website = await asyncio.to_thread(
-            website_service.claim_for_deploy,
-            SessionLocal(), settings,
-            key=ctx.website_key, mode=mode, website_name=cfg.website_name,
-            domain=cfg.domain, deployment_id=ctx.deployment_id,
-            deployer_email=cfg.deployer_email, resolve_placement=_resolve,
+            lambda: website_service.claim_for_deploy(
+                SessionLocal(), settings,
+                key=ctx.website_key, mode=mode, website_name=cfg.website_name,
+                domain=cfg.domain, deployment_id=ctx.deployment_id,
+                deployer_email=cfg.deployer_email, resolve_placement=_resolve,
+                run_service=cfg.run_service or "", run_region=cfg.run_region or "",
+                external_service=cfg.links_existing_service,
+            )
         )
         placement = Placement(website["placement"])
         _log(f"[INFRA] Website {ctx.website_key} — placement: {placement.value}")
@@ -626,16 +630,22 @@ class PipelineOrchestrator:
             )
 
         elif cfg.mode == DeploymentMode.CLOUDRUN:
-            from infra.cloudrun_deployer import CloudRunDeployer
             from infra.sites_lb import SitesLB
-            result = await CloudRunDeployer(config=settings, log_callback=_async_log).deploy(
-                website_name=cfg.website_name, image_uri=ctx.docker_image_uri,
-            )
+
+            if cfg.links_existing_service:
+                result = await self._adopt_cloud_run_service(ctx, _log)
+            else:
+                from infra.cloudrun_deployer import CloudRunDeployer
+                result = await CloudRunDeployer(config=settings, log_callback=_async_log).deploy(
+                    website_name=cfg.website_name, image_uri=ctx.docker_image_uri,
+                )
             if result.success:
                 run_app_url = result.url
                 exposure = await asyncio.to_thread(
                     lambda: SitesLB(settings, log=_log).expose_cloud_run(
                         cfg.website_name, cfg.domain,
+                        service=ctx.cloudrun_service_name if cfg.links_existing_service else "",
+                        region=ctx.cloudrun_region if cfg.links_existing_service else "",
                     )
                 )
                 result.url = exposure["url"]
@@ -679,6 +689,9 @@ class PipelineOrchestrator:
                 "dns_zone_created": bool(owns_domain and settings.PROD_AUTO_CREATE_DNS_ZONE),
                 "cdn_enabled": cfg.mode != DeploymentMode.CLOUDRUN,
                 "run_app_url": run_app_url,
+                "run_service": ctx.cloudrun_service_name,
+                "run_region": ctx.cloudrun_region,
+                "external_service": cfg.links_existing_service,
                 # The {app}.{apps domain} address, kept routed alongside a
                 # custom domain so the site is reachable while the custom
                 # domain's certificate provisions.
@@ -693,6 +706,67 @@ class PipelineOrchestrator:
             infra_update,
         )
         ctx.infra_resources = result.resources
+
+    async def _adopt_cloud_run_service(self, ctx: PipelineContext, log) -> "DeploymentResult":
+        """Verify the Cloud Run service this deployment links, and make sure
+        the load balancer can reach it.
+
+        Nothing is deployed here — the service is already running and belongs
+        to whoever created it. What the platform checks is what would
+        otherwise fail silently behind the LB: the service still exists, its
+        ingress admits load-balancer traffic, and anonymous callers may invoke
+        it (an external LB reaches Cloud Run unauthenticated, so a private
+        service answers 403 on the custom domain).
+        """
+        from models.deployment import DeploymentResult
+        from services.cloud_run_catalog import CloudRunCatalog, CloudRunLookupError
+
+        cfg = ctx.config
+        service_name, region = cfg.run_service or "", cfg.run_region or ""
+
+        def _adopt():
+            catalog = CloudRunCatalog(self._settings)
+            service = catalog.resolve(service_name, region)
+            if not service.lb_reachable:
+                log(
+                    f"[INFRA] ATTENTION: l'ingress de '{service.name}' est "
+                    f"{service.ingress} — le load balancer ne pourra pas l'atteindre. "
+                    "Passez-le à « Interne + Cloud Load Balancing » ou « Tout »."
+                )
+            if cfg.allow_unauthenticated:
+                if catalog.allow_unauthenticated(service.name, service.region):
+                    log(f"[INFRA] Accès public (allUsers → run.invoker) accordé à '{service.name}'")
+                else:
+                    log(f"[INFRA] '{service.name}' accepte déjà les appels anonymes")
+            elif not catalog.is_public(service.name, service.region):
+                log(
+                    f"[INFRA] ATTENTION: '{service.name}' n'accepte pas les appels "
+                    "anonymes — le domaine répondra 403 tant que allUsers n'a pas "
+                    "le rôle run.invoker."
+                )
+            return service
+
+        try:
+            service = await asyncio.to_thread(_adopt)
+        except CloudRunLookupError as exc:
+            return DeploymentResult(
+                mode="cloudrun", website_name=cfg.website_name, success=False, error=str(exc),
+            )
+
+        ctx.cloudrun_service_name = service.name
+        ctx.cloudrun_region = service.region
+        log(
+            f"[INFRA] Service Cloud Run existant '{service.name}' ({service.region}) "
+            f"— {service.url}"
+        )
+        return DeploymentResult(
+            mode="cloudrun",
+            website_name=cfg.website_name,
+            success=True,
+            url=service.url,
+            cloudrun_service=service.name,
+            docker_image=service.last_image,
+        )
 
     async def _step_upload(self, ctx: PipelineContext, log_cb: Callable) -> None:
         if ctx.config.mode == DeploymentMode.CLOUDRUN:

@@ -50,7 +50,9 @@ def create_deployment(
     mode: str,
     domain: Optional[str],
     notification_emails: str,
-    zip_filename: str,
+    # None for a deployment with no sources (an existing Cloud Run service
+    # linked to a domain).
+    zip_filename: Optional[str],
     deployer_first_name: str = "",
     deployer_last_name: str = "",
     deployer_email: str = "",

@@ -1,11 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Loader, Rocket, CheckCircle, AlertTriangle, XCircle, Info, Eye, Calendar, X, GitBranch } from "lucide-react";
+import { Loader, Rocket, CheckCircle, AlertTriangle, XCircle, Info, Eye, Calendar, X, GitBranch, Link2, Upload } from "lucide-react";
 import UploadZone from "./UploadZone";
 import QuotaRequestModal from "./QuotaRequestModal";
 import {
   deployWebsite, checkDomain, createPreview, deletePreview,
   deployFromGit, getGitPushEvents, getGitConnections, lookupWebsite,
+  deployCloudRunService, listCloudRunServices, resolveCloudRunService,
 } from "../services/api";
 import { useAuth } from "../contexts/AuthContext";
 
@@ -23,6 +24,16 @@ export default function DeploymentForm() {
   const [gitContext, setGitContext] = useState(null); // { event, connection }
 
   const [uploadData, setUploadData] = useState(null); // { type, files } | null
+  // What is being deployed: files the user uploads, or a Cloud Run service
+  // that is already running and only needs a domain in front of it.
+  const [source, setSource] = useState("upload"); // "upload" | "service"
+  const [serviceRef, setServiceRef] = useState(""); // URL or name the user typed
+  const [serviceList, setServiceList] = useState([]); // picker options
+  const [resolvedService, setResolvedService] = useState(null);
+  const [serviceStatus, setServiceStatus] = useState(null); // null|"checking"|"ok"|"error"
+  const [serviceError, setServiceError] = useState("");
+  const [allowUnauthenticated, setAllowUnauthenticated] = useState(true);
+  const serviceTimer = useRef(null);
   const [mode, setMode] = useState("demo"); // UI mode: "demo" | "prod" | "subdomain" | "cloudrun"
   const [websiteName, setWebsiteName] = useState("");
   const [domain, setDomain] = useState("");
@@ -64,8 +75,63 @@ export default function DeploymentForm() {
   useEffect(() => {
     if (isSimpleUser) {
       setMode("demo");
+      setSource("upload");
     }
   }, [isSimpleUser]);
+
+  // Linking a service is a Cloud Run deployment by definition.
+  useEffect(() => {
+    if (source === "service") setMode("cloudrun");
+  }, [source]);
+
+  // Load the project's services once, so the field can offer them.
+  useEffect(() => {
+    if (source !== "service" || serviceList.length) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const services = await listCloudRunServices();
+        if (!cancelled) setServiceList(services);
+      } catch {
+        // The field still accepts a pasted URL — the backend resolves it.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [source, serviceList.length]);
+
+  // Resolve whatever was typed (URL or name) against the project.
+  useEffect(() => {
+    setResolvedService(null);
+    setServiceError("");
+    if (serviceTimer.current) clearTimeout(serviceTimer.current);
+    if (source !== "service") {
+      setServiceStatus(null);
+      return;
+    }
+    const reference = serviceRef.trim();
+    if (reference.length < 2) {
+      setServiceStatus(null);
+      return;
+    }
+    setServiceStatus("checking");
+    serviceTimer.current = setTimeout(async () => {
+      try {
+        const service = await resolveCloudRunService(reference);
+        setResolvedService(service);
+        setServiceStatus("ok");
+        setWebsiteName((prev) => prev || slugify(service.name).replace(/-{2,}/g, "-"));
+      } catch (err) {
+        setServiceStatus("error");
+        setServiceError(
+          err.response?.data?.detail || err.message || "Service introuvable."
+        );
+      }
+    }, 600);
+    return () => {
+      if (serviceTimer.current) clearTimeout(serviceTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceRef, source]);
 
   // Load Git deployment context when navigated from /git with ?from_git=XXX
   useEffect(() => {
@@ -227,12 +293,18 @@ export default function DeploymentForm() {
     setWebsiteName(slugify(e.target.value));
   }, []);
 
+  // Linking an existing service needs no files — but it does need the
+  // service itself, and the domain it is being put on. Declared before the
+  // validity rules below, which read it.
+  const linksService = source === "service" && !gitContext;
+  const hasService = linksService && serviceStatus === "ok" && Boolean(resolvedService);
+
   // Domain is valid if: not prod/subdomain, or check pending/passed, or external.
   // "checking" is allowed so the deploy button isn't blocked while the API responds
   // — the backend validates domain ownership independently.
   const domainValid =
     !modeTakesDomain ||
-    (mode === "cloudrun" && !domain.trim()) ||
+    (mode === "cloudrun" && !linksService && !domain.trim()) ||
     domainStatus === null ||
     domainStatus === "checking" ||
     domainStatus === "owned" ||
@@ -250,12 +322,13 @@ export default function DeploymentForm() {
       parentDomain.includes("."));
 
   const canSubmit =
-    (hasUpload || hasGitSource) &&
+    (hasUpload || hasGitSource || hasService) &&
     trimSlug(websiteName).length > 1 &&
     deployerFirstName.trim().length > 0 &&
     deployerLastName.trim().length > 0 &&
     deployerEmail.trim().length > 0 &&
     (mode !== "prod" || domain.trim().length > 0) &&
+    (!linksService || domain.trim().includes(".")) &&
     subdomainValid &&
     domainValid;
 
@@ -320,6 +393,24 @@ export default function DeploymentForm() {
             : "";
 
       try {
+        // ── Existing Cloud Run service → domain ─────────────────────
+        if (linksService) {
+          const data = await deployCloudRunService({
+            service: resolvedService.url || resolvedService.name,
+            region: resolvedService.region,
+            domain: domain.trim().toLowerCase(),
+            website_name: siteName,
+            allow_unauthenticated: allowUnauthenticated,
+            domain_purchase_confirmed: domainPurchaseConfirmed,
+            notification_emails: notificationEmails.trim() || "",
+            deployer_first_name: deployerFirstName.trim(),
+            deployer_last_name: deployerLastName.trim(),
+            deployer_email: deployerEmail.trim(),
+          });
+          navigate(`/deployments/${data.deployment_id}`);
+          return;
+        }
+
         // ── Git deployment path ──────────────────────────────────────
         if (gitContext) {
           const body = {
@@ -396,7 +487,7 @@ export default function DeploymentForm() {
         setSubmitting(false);
       }
     },
-    [canSubmit, submitting, uploadData, mode, websiteName, domain, parentDomain, subdomainLabel, composedSubdomainFqdn, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate, gitContext, fromGitCommit]
+    [canSubmit, submitting, uploadData, mode, websiteName, domain, parentDomain, subdomainLabel, composedSubdomainFqdn, deployerFirstName, deployerLastName, deployerEmail, aiEnabled, notificationEmails, domainPurchaseConfirmed, showSchedule, scheduledAt, navigate, gitContext, fromGitCommit, linksService, resolvedService, allowUnauthenticated]
   );
 
   return (
@@ -406,7 +497,9 @@ export default function DeploymentForm() {
         <p className="mt-2 text-gray-600">
           {gitContext
             ? "Deploiement depuis Git — pas besoin d'upload."
-            : "Upload your website files and configure the deployment."}
+            : linksService
+              ? "Servez un service Cloud Run deja en ligne sur un vrai nom de domaine."
+              : "Upload your website files and configure the deployment."}
         </p>
       </div>
 
@@ -432,11 +525,155 @@ export default function DeploymentForm() {
         </div>
       )}
 
-      {/* Upload Zone (hidden in git mode) */}
-      {!gitContext && <UploadZone onFilesSelected={setUploadData} />}
+      {/* Source selector — files, or a Cloud Run service already running */}
+      {!gitContext && !isSimpleUser && (
+        <div className="mb-6">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Source du d&eacute;ploiement
+          </label>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setSource("upload")}
+              className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all text-left ${
+                source === "upload"
+                  ? "border-[#2563EB] bg-[#2563EB] text-white shadow-md"
+                  : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <Upload className="w-4 h-4" />
+                Code source
+              </span>
+              <span className="block text-xs font-normal mt-0.5 opacity-80">
+                ZIP, dossier ou fichiers
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSource("service")}
+              className={`flex-1 py-3 px-4 rounded-lg text-sm font-semibold border-2 transition-all text-left ${
+                source === "service"
+                  ? "border-teal-600 bg-teal-600 text-white shadow-md"
+                  : "border-gray-200 bg-white text-gray-700 hover:border-gray-300"
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <Link2 className="w-4 h-4" />
+                Service Cloud Run existant
+              </span>
+              <span className="block text-xs font-normal mt-0.5 opacity-80">
+                Lier une app d&eacute;j&agrave; en ligne &agrave; un domaine
+              </span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Cloud Run service picker (replaces the upload zone) */}
+      {linksService && (
+        <div className="p-5 bg-white border-2 border-teal-200 rounded-xl">
+          <label
+            htmlFor="cloudrun-service"
+            className="block text-sm font-medium text-gray-700 mb-1"
+          >
+            Service Cloud Run <span className="text-red-500">*</span>
+          </label>
+          <input
+            id="cloudrun-service"
+            type="text"
+            list="cloudrun-service-options"
+            value={serviceRef}
+            onChange={(e) => setServiceRef(e.target.value)}
+            placeholder="https://mon-service-123456789.europe-west1.run.app"
+            className="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-sm
+              focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent
+              placeholder-gray-400"
+            autoComplete="off"
+          />
+          <datalist id="cloudrun-service-options">
+            {serviceList.map((svc) => (
+              <option key={`${svc.region}/${svc.name}`} value={svc.url || svc.name}>
+                {svc.name} &mdash; {svc.region}
+              </option>
+            ))}
+          </datalist>
+          <p className="mt-1 text-xs text-gray-500">
+            Collez l&apos;URL <span className="font-mono">.run.app</span> du service, ou
+            tapez son nom pour le choisir dans la liste
+            {serviceList.length > 0 && <> ({serviceList.length} services dans le projet)</>}.
+          </p>
+
+          {serviceStatus === "checking" && (
+            <div className="mt-3 flex items-center gap-2 text-sm text-gray-500">
+              <Loader className="w-4 h-4 animate-spin" />
+              V&eacute;rification du service...
+            </div>
+          )}
+          {serviceStatus === "error" && (
+            <div className="mt-3 flex items-start gap-2 text-sm text-red-600">
+              <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <span>{serviceError}</span>
+            </div>
+          )}
+          {serviceStatus === "ok" && resolvedService && (
+            <div className="mt-3 p-3 bg-teal-50 border border-teal-200 rounded-lg space-y-1.5">
+              <div className="flex items-center gap-2 text-sm text-teal-800">
+                <CheckCircle className="w-4 h-4 flex-shrink-0" />
+                <span>
+                  <strong>{resolvedService.name}</strong> &mdash; {resolvedService.region}
+                </span>
+              </div>
+              {resolvedService.url && (
+                <div className="text-xs text-teal-700 font-mono break-all ml-6">
+                  {resolvedService.url}
+                </div>
+              )}
+              {!resolvedService.lb_reachable && (
+                <div className="flex items-start gap-2 text-xs text-amber-700 ml-6">
+                  <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                  <span>
+                    Ingress <span className="font-mono">{resolvedService.ingress}</span> &mdash;
+                    le load balancer ne pourra pas atteindre ce service. Passez-le &agrave;
+                    &laquo;&nbsp;Interne + Cloud Load Balancing&nbsp;&raquo; ou &laquo;&nbsp;Tout&nbsp;&raquo;.
+                  </span>
+                </div>
+              )}
+              {resolvedService.public === false && (
+                <div className="flex items-start gap-2 text-xs text-amber-700 ml-6">
+                  <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                  <span>
+                    Ce service n&apos;accepte pas encore les appels anonymes &mdash; requis
+                    pour qu&apos;un load balancer externe le serve.
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          <label className="mt-3 flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allowUnauthenticated}
+              onChange={(e) => setAllowUnauthenticated(e.target.checked)}
+              className="mt-0.5 h-4 w-4 rounded border-gray-300 text-teal-600 focus:ring-teal-500"
+            />
+            <span className="text-xs text-gray-600">
+              Autoriser les appels anonymes sur ce service
+              (<span className="font-mono">allUsers</span> &rarr;{" "}
+              <span className="font-mono">run.invoker</span>) &mdash; n&eacute;cessaire pour
+              qu&apos;un load balancer externe puisse le servir&nbsp;; sans cela le
+              domaine r&eacute;pondra 403.
+            </span>
+          </label>
+        </div>
+      )}
+
+      {/* Upload Zone (hidden in git mode and when linking a service) */}
+      {!gitContext && !linksService && <UploadZone onFilesSelected={setUploadData} />}
 
       {/* Configuration form */}
-      {(uploadData || gitContext) && (
+      {(uploadData || gitContext || hasService) && (
         <form onSubmit={handleSubmit} className="mt-8 space-y-6">
           {/* Deployer identity fields */}
           <div className="grid grid-cols-2 gap-4">
@@ -501,7 +738,16 @@ export default function DeploymentForm() {
             />
           </div>
 
-          {/* Mode selector */}
+          {/* Mode selector — a linked service is a Cloud Run deployment */}
+          {linksService ? (
+            <div className="p-3 bg-teal-50 border border-teal-200 rounded-lg flex items-center gap-2 text-sm text-teal-800">
+              <Link2 className="w-4 h-4 flex-shrink-0" />
+              <span>
+                Mode <strong>Cloud Run</strong> &mdash; le service existant est plac&eacute;
+                derri&egrave;re le load balancer, rien n&apos;est reconstruit.
+              </span>
+            </div>
+          ) : (
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">
               Deployment Mode
@@ -569,6 +815,7 @@ export default function DeploymentForm() {
               )}
             </div>
           </div>
+          )}
 
           {/* Website name */}
           <div>
@@ -815,8 +1062,12 @@ export default function DeploymentForm() {
                   htmlFor="cloudrun-domain"
                   className="block text-sm font-medium text-gray-700 mb-1"
                 >
-                  Domaine personnalis&eacute;{" "}
-                  <span className="text-gray-400 font-normal">(optionnel)</span>
+                  Domaine{" "}
+                  {linksService ? (
+                    <span className="text-red-500">*</span>
+                  ) : (
+                    <span className="text-gray-400 font-normal">(optionnel)</span>
+                  )}
                 </label>
                 <input
                   id="cloudrun-domain"
@@ -829,11 +1080,24 @@ export default function DeploymentForm() {
                     placeholder-gray-400"
                 />
                 <p className="mt-1 text-xs text-gray-500">
-                  Sans domaine, l&apos;app est servie sur{" "}
-                  <span className="font-mono">
-                    {(websiteName.trim() || "mon-app")}.digitaldatatest.com
-                  </span>
-                  . Avec un domaine, elle est servie sur les deux.
+                  {linksService ? (
+                    <>
+                      Le domaine sur lequel servir ce service. Il reste aussi joignable
+                      imm&eacute;diatement sur{" "}
+                      <span className="font-mono">
+                        {(websiteName.trim() || "mon-app")}.digitaldatatest.com
+                      </span>
+                      , pendant que le certificat se provisionne.
+                    </>
+                  ) : (
+                    <>
+                      Sans domaine, l&apos;app est servie sur{" "}
+                      <span className="font-mono">
+                        {(websiteName.trim() || "mon-app")}.digitaldatatest.com
+                      </span>
+                      . Avec un domaine, elle est servie sur les deux.
+                    </>
+                  )}
                 </p>
               </div>
 
@@ -889,7 +1153,15 @@ export default function DeploymentForm() {
                 <ul className="space-y-1.5 text-xs text-teal-700">
                   <li className="flex items-start gap-2">
                     <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                    <span><strong>Image Docker</strong> (Cloud Build) + service <strong>Cloud Run</strong> public</span>
+                    {linksService ? (
+                      <span>
+                        Le service <strong>{resolvedService?.name || "Cloud Run"}</strong> est
+                        r&eacute;utilis&eacute; tel quel &mdash; aucune image reconstruite, et il ne
+                        sera pas supprim&eacute; avec le site
+                      </span>
+                    ) : (
+                      <span><strong>Image Docker</strong> (Cloud Build) + service <strong>Cloud Run</strong> public</span>
+                    )}
                   </li>
                   <li className="flex items-start gap-2">
                     <CheckCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -919,7 +1191,8 @@ export default function DeploymentForm() {
             </div>
           )}
 
-          {/* AI Validation toggle */}
+          {/* AI Validation toggle — nothing to inspect without sources */}
+          {!linksService && (
           <div className="flex items-start gap-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
             <div className="flex-1">
               <label
@@ -950,6 +1223,7 @@ export default function DeploymentForm() {
               />
             </button>
           </div>
+          )}
 
           {/* Notification emails */}
           <div>
@@ -975,7 +1249,7 @@ export default function DeploymentForm() {
           </div>
 
           {/* Schedule toggle (super_user / admin only) */}
-          {!isSimpleUser && (
+          {!isSimpleUser && !linksService && (
             <div className="flex items-start gap-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
               <div className="flex-1">
                 <label className="block text-sm font-medium text-gray-700">
@@ -1032,7 +1306,8 @@ export default function DeploymentForm() {
 
           {/* Action buttons */}
           <div className="flex gap-3">
-            {/* Preview button */}
+            {/* Preview button — nothing to preview without uploaded files */}
+            {!linksService && (
             <button
               type="button"
               onClick={handlePreview}
@@ -1052,6 +1327,7 @@ export default function DeploymentForm() {
               )}
               Preview
             </button>
+            )}
 
             {/* Submit */}
             <button
@@ -1079,6 +1355,11 @@ export default function DeploymentForm() {
                 <>
                   <GitBranch className="w-5 h-5" />
                   Deploy from Git
+                </>
+              ) : linksService ? (
+                <>
+                  <Link2 className="w-5 h-5" />
+                  Lier au domaine
                 </>
               ) : (
                 <>

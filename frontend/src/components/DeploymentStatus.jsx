@@ -507,6 +507,18 @@ export default function DeploymentStatus({ deployment }) {
                     <dd className="text-sm font-mono font-medium text-gray-900 break-all">
                       {deployment.infra_details.run_app_url}
                     </dd>
+                    {deployment.infra_details?.external_service && (
+                      <dd className="mt-1 text-xs text-teal-700">
+                        Service existant{" "}
+                        <span className="font-mono">
+                          {deployment.infra_details.run_service}
+                        </span>
+                        {deployment.infra_details.run_region && (
+                          <> ({deployment.infra_details.run_region})</>
+                        )}{" "}
+                        &mdash; lie par la plateforme, il ne sera pas supprime avec le site.
+                      </dd>
+                    )}
                   </div>
                 </div>
               )}

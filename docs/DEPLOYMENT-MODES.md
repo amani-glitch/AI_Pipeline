@@ -382,6 +382,37 @@ Pour un domaine deja enregistre ailleurs (GoDaddy, OVH...), rien n'est achete : 
 zone Cloud DNS est creee et les nameservers a configurer chez le registrar sont
 affiches dans les logs du deploiement et dans l'email de notification.
 
+### Service Cloud Run existant → domaine
+
+Quand l'application tourne deja, il n'y a rien a construire : la plateforme ne
+pose que la facade. L'utilisateur fournit deux entrees, l'URL (ou le nom) du
+service et le domaine.
+
+```
+POST /api/deploy/cloud-run-service
+{ "service": "https://mon-api-123456789.europe-west1.run.app",
+  "domain":  "mon-api.com" }
+```
+
+```
+                                     ┌─ host rule {domaine}      ─┐
+domaine ──DNS A──► IP du LB ──► URL map                           ├─► backend service ─► NEG ─► service Cloud Run
+                                     └─ host rule {app}.{apps}   ─┘        (cree)      (cree)      (existant)
+```
+
+| Etape | Ce qui se passe |
+|-------|-----------------|
+| Resolution | L'URL collee est comparee aux services reels du projet (`run.v2`, `locations/-`). Les deux generations d'URL `.run.app` sont acceptees ; un service d'un autre projet est refuse (422) — un NEG serverless ne peut pas le cibler |
+| Pipeline | `DOMAIN_REGISTER → INFRA → NOTIFY`. EXTRACT, AI_INSPECT, AI_FIX, BUILD, VERIFY et UPLOAD sont marques `skipped` |
+| NEG | Cree **dans la region du service**, pas dans `CLOUDRUN_REGION` : un NEG regional doit vivre la ou vit son service |
+| Acces | `allUsers → roles/run.invoker` accorde si la case est cochee (defaut). La policy existante est **fusionnee**, jamais remplacee : le service appartient a son proprietaire |
+| Ingress | `INGRESS_TRAFFIC_INTERNAL_ONLY` est signale dans les logs — le LB externe ne peut pas atteindre un tel service |
+| Suppression | La facade est retiree ; le service Cloud Run et ses images ne le sont **jamais** (`external_service` sur le document website) |
+
+Un site retient sa source : deployer un ZIP sur un site lie, ou lier un service
+a un site construit depuis des sources, est refuse (409). Les deux cas
+laisseraient derriere eux des ressources que plus rien ne supprimerait.
+
 ---
 
 ## Comparaison des couts

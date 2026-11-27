@@ -72,12 +72,22 @@ def website_key(mode: str, website_name: str, domain: Optional[str], settings: S
 
 @dataclass(frozen=True)
 class WebsiteRef:
-    """Everything needed to locate a website's resources."""
+    """Everything needed to locate a website's resources.
+
+    ``run_service`` / ``run_region`` are set for a Cloud Run website that was
+    *linked* rather than built here: the platform owns its front door (NEG,
+    backend service, host rules, certificate, DNS) but not the service, which
+    may also live in another region than ``CLOUDRUN_REGION``. ``external_service``
+    is what keeps a delete from destroying someone else's container.
+    """
     key: str
     mode: str
     website_name: str
     domain: str
     placement: Placement
+    run_service: str = ""
+    run_region: str = ""
+    external_service: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -195,20 +205,30 @@ class AppNames:
     ar_package: str
 
 
-def app_names(website_name: str, s: Settings) -> AppNames:
+def app_names(
+    website_name: str,
+    s: Settings,
+    run_service: str = "",
+    run_region: str = "",
+) -> AppNames:
     """Cloud Run website: the service plus its LB front door.
 
     Cloud Run service ids are capped at 49 characters; names that fit keep
     the ``safe_name`` form used before, so existing services are reused.
+
+    A *linked* website points at a service it did not create: ``run_service``
+    and ``run_region`` then name that service, and the NEG — which must sit in
+    the service's region — follows it there. The front-door names stay derived
+    from the website, since the platform owns those.
     """
     service = bounded_name(safe_name(website_name), 49)
     return AppNames(
-        service=service,
+        service=run_service or service,
         neg=_named("wd-neg-", website_name),
         backend_service=_named("wd-app-", website_name),
         matcher=_named("wd-app-", website_name),
         host=f"{website_name}.{s.SITES_APPS_DOMAIN}",
-        region=s.CLOUDRUN_REGION,
+        region=run_region or s.CLOUDRUN_REGION,
         ar_package=website_name,
     )
 
